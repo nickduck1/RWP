@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Retro Test Page</title>
+<style>
+  body {
+    background: url('clippy.jpg') center center / cover no-repeat fixed;
+    font-family: Tahoma, Verdana, sans-serif;
+    margin: 0;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .window {
+    position: absolute;
+    top: 100px;
+    left: 100px;
+    border: 2px solid #fff;
+    border-top-color: #ccc;
+    border-left-color: #ccc;
+    background-color: #ece9d8;
+    width: 400px;
+    box-shadow: 2px 2px 0 #000;
+    resize: both;
+    overflow: hidden;
+  }
+  .titlebar {
+    background: linear-gradient(to right, #000080, #1084d0);
+    color: white;
+    padding: 3px 5px;
+    font-weight: bold;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    cursor: move;
+    user-select: none;
+  }
+  .titlebar button {
+    background-color: #c0c0c0;
+    border: 1px solid #fff;
+    border-top-color: #808080;
+    border-left-color: #808080;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .menubar {
+    background-color: #c0c0c0;
+    padding: 2px 5px;
+    font-size: 13px;
+    border-bottom: 2px solid #808080;
+  }
+  .menubar span {
+    margin-right: 15px;
+    cursor: default;
+  }
+  .content {
+    padding: 10px;
+    font-size: 13px;
+  }
+  .retro-btn {
+    background-color: #c0c0c0;
+    border: 2px solid #fff;
+    border-top-color: #808080;
+    border-left-color: #808080;
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 13px;
+    margin: 3px;
+  }
+  .retro-btn:active {
+    border: 2px solid #808080;
+    border-top-color: #fff;
+    border-left-color: #fff;
+  }
+  input.retro-input, select.retro-input {
+    background-color: white;
+    border: 2px solid #fff;
+    border-top-color: #808080;
+    border-left-color: #808080;
+    padding: 3px;
+    font-size: 13px;
+    width: calc(100% - 10px);
+    margin-bottom: 5px;
+  }
+  .progress-bar {
+    background-color: #c0c0c0;
+    border: 2px solid #fff;
+    border-top-color: #808080;
+    border-left-color: #808080;
+    height: 20px;
+    width: 100%;
+    margin: 5px 0;
+    position: relative;
+  }
+  .progress {
+    background-color: #000080;
+    height: 100%;
+    width: 0%;
+    transition: width 0.2s;
+  }
+  video {
+    border: 2px solid #fff;
+    border-top-color: #808080;
+    border-left-color: #808080;
+    background-color: black;
+    width: 100%;
+    margin-top: 5px;
+  }
+</style>
+</head>
+<body>
+
+<div class="window" id="window1">
+  <div class="titlebar" id="titlebar1">
+    <span>Test Page</span>
+    <button onclick="closeWindow('window1')">X</button>
+  </div>
+  <div class="menubar">
+    <span>File</span>
+    <span>Edit</span>
+    <span>View</span>
+    <span>Help</span>
+  </div>
+  <div class="content">
+    <p>Welcome to the retro test page!</p>
+    <input class="retro-input" type="text" id="nameInput" placeholder="Enter your name"><br>
+    <button class="retro-btn" onclick="sayHello()">Say Hello</button>
+    <button class="retro-btn" onclick="changeBG()">Change BG</button>
+    <button class="retro-btn" onclick="resetBG()">Reset BG</button>
+    <button class="retro-btn" onclick="showAlert()">Alert</button>
+    <button class="retro-btn" onclick="startLoading()">Fake Load</button>
+    <button class="retro-btn" onclick="showTime()">Show Time</button>
+    <button class="retro-btn" onclick="sendTestPost()">Send Test POST</button>
+    <button class="retro-btn" onclick="downloadVideo()">Download Video</button>
+    <p id="output"></p>
+    <div class="progress-bar"><div class="progress" id="progressBar"></div></div>
+
+    <audio id="audioPreview" controls>
+      <source src="sample.mp3" type="audio/mpeg">
+      Your browser does not support the audio tag.
+    </audio>
+    <video id="videoPreview" controls>
+      <source src="sample.mp4" type="video/mp4">
+      Your browser does not support the video tag.
+    </video>
+  </div>
+</div>
+
+<script>
+function makeDraggable(windowId, titleId) {
+  const win = document.getElementById(windowId);
+  const title = document.getElementById(titleId);
+  let offsetX = 0, offsetY = 0, isDragging = false;
+
+  title.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    offsetX = e.clientX - win.offsetLeft;
+    offsetY = e.clientY - win.offsetTop;
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (isDragging) {
+      win.style.left = (e.clientX - offsetX) + 'px';
+      win.style.top = (e.clientY - offsetY) + 'px';
+    }
+  });
+  document.addEventListener('mouseup', () => { isDragging = false; });
+}
+makeDraggable('window1', 'titlebar1');
+
+function sayHello() {
+  const name = document.getElementById("nameInput").value || "stranger";
+  document.getElementById("output").innerText = "Hello, " + name + "!";
+}
+function changeBG() { document.body.style.backgroundColor = "#99ccff"; }
+function resetBG() { document.body.style.background = "url('image.png') center center / cover no-repeat fixed"; }
+function closeWindow(id) { document.getElementById(id).style.display = "none"; }
+function showAlert() { alert("This is a retro alert box!"); }
+
+function startLoading() {
+  let progress = 0;
+  const bar = document.getElementById("progressBar");
+  bar.style.width = "0%";
+  const interval = setInterval(() => {
+    progress += 5;
+    bar.style.width = progress + "%";
+    if (progress >= 100) {
+      clearInterval(interval);
+      alert("Loading complete!");
+    }
+  }, 100);
+}
+
+function downloadVideo() {
+  // Grab the first <source> inside the <video>
+  const videoSrc = document.querySelector('#videoPreview source').src;
+  // Create an invisible <a>, click it, then clean up
+  const a = document.createElement('a');
+  a.href = videoSrc;
+  a.download = 'sample.mp4';     // suggested file name
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function showTime() {
+  const now = new Date();
+  document.getElementById("output").innerText = "Current time: " + now.toLocaleTimeString();
+}
+
+function sendTestPost() {
+  fetch("echo.php", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: "Hello from retro UI!",
+      time: new Date().toISOString()
+    })
+  })
+  .then(res => res.json())
+  .then(data => {
+    document.getElementById("output").innerText =
+      "Server response:\n" + JSON.stringify(data, null, 2);
+  })
+  .catch(err => {
+    document.getElementById("output").innerText = "Error: " + err;
+  });
+}
+</script>
+
+</body>
+</html>
