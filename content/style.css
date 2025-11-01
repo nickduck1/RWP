@@ -1,0 +1,99 @@
+body {
+  background: url('clippy.jpg') center center / cover no-repeat fixed;
+  font-family: Tahoma, Verdana, sans-serif;
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.window {
+  position: absolute;
+  top: 100px;
+  left: 100px;
+  border: 2px solid #fff;
+  border-top-color: #ccc;
+  border-left-color: #ccc;
+  background-color: #ece9d8;
+  width: 400px;
+  box-shadow: 2px 2px 0 #000;
+  resize: both;
+  overflow: hidden;
+}
+.titlebar {
+  background: linear-gradient(to right, #000080, #1084d0);
+  color: white;
+  padding: 3px 5px;
+  font-weight: bold;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  cursor: move;
+  user-select: none;
+}
+.titlebar button {
+  background-color: #c0c0c0;
+  border: 1px solid #fff;
+  border-top-color: #808080;
+  border-left-color: #808080;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font-size: 12px;
+  cursor: pointer;
+}
+.menubar {
+  background-color: #c0c0c0;
+  padding: 2px 5px;
+  font-size: 13px;
+  border-bottom: 2px solid #808080;
+}
+.menubar span {
+  margin-right: 15px;
+  cursor: default;
+}
+.content {
+  padding: 10px;
+  font-size: 13px;
+}
+.retro-btn {
+  background-color: #c0c0c0;
+  border: 2px solid #fff;
+  border-top-color: #808080;
+  border-left-color: #808080;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  margin: 3px;
+}
+.retro-btn:active {
+  border: 2px solid #808080;
+  border-top-color: #fff;
+  border-left-color: #fff;
+}
+input.retro-input, select.retro-input {
+  background-color: white;
+  border: 2px solid #fff;
+  border-top-color: #808080;
+  border-left-color: #808080;
+  padding: 3px;
+  font-size: 13px;
+  width: calc(100% - 10px);
+  margin-bottom: 5px;
+}
+.progress-bar {
+  background-color: #c0c0c0;
+  border: 2px solid #fff;
+  border-top-color: #808080;
+  border-left-color: #808080;
+  height: 20px;
+  width: 100%;
+  margin: 5px 0;
+  position: relative;
+}
+.progress {
+  background-color: #000080;
+  height: 100%;
+  width: 0%;
+  transition: width 0.2s;
+}
