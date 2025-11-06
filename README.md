@@ -19,7 +19,8 @@ The Core is still under development.
 This is an early release version!
 
 What’s Left:
-The only thing remaining in the Core is implementing the rendezvous_key search/find feature.
+- The only thing remaining in the Core is implementing the rendezvous_key search/find feature. (DONE)
+- Integrate the real server (not tserver.py), with the core (RRKDHT.py).
 
 Note:
 It may take a while to be ready for real use (production), Because i have studies and AI is not that good in helping.
