@@ -1680,7 +1680,7 @@ class RRKDHTProtocol(RPCProtocol):
             return (False, False)
 
     def welcome_if_new(self, node):
-        """Enhanced welcome with duplicate prevention and timestamp update."""
+        """Enhanced welcome with duplicate prevention and neighbor limit respect."""
         # Skip if it's ourselves
         if node.id == self.source_node.id:
             return
@@ -1709,8 +1709,21 @@ class RRKDHTProtocol(RPCProtocol):
                 # Update node with rendezvous key
                 node.rendezvous_key = node_info.rendezvous_key
 
+        # FIXED: Only replicate data if node will actually be added to routing table
+        # Check if we should accept this node BEFORE replicating data
+        if not self.router.should_accept_new_neighbor(node):
+            log.debug(f"Not replicating data to {node} - won't be added to routing table")
+            return
+        
         # Send stored values that the new node should have
+        # FIXED: Limit the number of concurrent replication operations
+        replication_tasks = []
+        max_replications = 10  # Limit concurrent replications
+        
         for key, value in self.storage:
+            if len(replication_tasks) >= max_replications:
+                break  # Don't overwhelm the network
+                
             keynode = Node(digest(key))
             neighbors = self.router.find_neighbors(keynode)
             if neighbors:
@@ -1719,8 +1732,15 @@ class RRKDHTProtocol(RPCProtocol):
                 first = neighbors[0].distance_to(keynode)
                 this_closest = self.source_node.distance_to(keynode) < first
             if not neighbors or (new_node_close and this_closest):
-                asyncio.ensure_future(self.call_store(node, key, value))
+                replication_tasks.append(self.call_store(node, key, value))
         
+        # Schedule replications but don't wait for them
+        if replication_tasks:
+            log.debug(f"Scheduling {len(replication_tasks)} replication operations to {node}")
+            for task in replication_tasks:
+                asyncio.ensure_future(task)
+        
+        # Add contact to routing table
         self.router.add_contact(node)
 
     def _find_existing_node(self, target_node):
@@ -2597,9 +2617,12 @@ class RRKDHT:
         if hasattr(self, 'heartbeat_loop') and self.heartbeat_loop: 
             self.heartbeat_loop.cancel()
         
-        # NEW: Stop responsible node checking
         if hasattr(self, 'responsible_check_loop') and self.responsible_check_loop:
             self.responsible_check_loop.cancel()
+        
+        # NEW: Stop rendezvous announcements
+        if hasattr(self, 'rdv_announcement_loop') and self.rdv_announcement_loop:
+            self.rdv_announcement_loop.cancel()
             
         if self.rwp_handler:
             self.rwp_handler.stop_rwp_server()
@@ -2609,7 +2632,7 @@ class RRKDHT:
 
         self._rejoin_attempts = 0
         self._identity_regeneration_count = 0
-        self._pending_verification = False  
+        self._pending_verification = False
 
     def _create_protocol(self):
         """Create protocol and set up router reference."""
@@ -2660,11 +2683,19 @@ class RRKDHT:
         
         # Start key rotation monitoring
         self._start_key_rotation_monitor()
+        
         # Schedule refreshing table
         self.refresh_table()
         self.start_heartbeat()
+        
         # NEW: Start responsible node checking
         self._schedule_responsible_check()
+        
+        # NEW: Start rendezvous key announcements
+        self._schedule_rendezvous_announcement()
+        
+        # NEW: Make initial announcement
+        await self.announce_rendezvous_key()
 
     def _update_network_conditions(self, ping_time, success):
         """Update network conditions based on recent ping performance."""
@@ -3145,6 +3176,197 @@ class RRKDHT:
                 nodes_queried=0
             )
 
+    async def announce_rendezvous_key(self):
+        """
+        Announce this node's rendezvous key to the DHT.
+        Stores mapping: rendezvous_key -> (node_id, ip, port, rwp_port, epoch, timestamp)
+        """
+        try:
+            rendezvous_key = self.rwp_handler.rendezvous_key
+            current_epoch = self.epoch_manager.get_current_epoch()
+            
+            # Create announcement data
+            announcement = {
+                'node_id': self.node.id.hex(),
+                'ip': self.node.ip,
+                'port': self.node.port,
+                'rwp_port': self.rwp_port,
+                'epoch': current_epoch,
+                'timestamp': time.time(),
+                'rendezvous_key': rendezvous_key
+            }
+            
+            # FIXED: Store using rendezvous key directly (not digest)
+            # The key itself becomes the DHT key
+            announcement_json = json.dumps(announcement)
+            success = await self.set(rendezvous_key, announcement_json)
+            
+            if success:
+                log.info(f"Announced rendezvous key: {rendezvous_key} -> {announcement}")
+            else:
+                log.warning(f"Failed to announce rendezvous key: {rendezvous_key}")
+            
+            return success
+            
+        except Exception as e:
+            log.error(f"Error announcing rendezvous key: {e}")
+            return False
+
+    async def lookup_by_rendezvous_key(self, rendezvous_key: str) -> Optional[Dict]:
+        """
+        Look up a node by its rendezvous key.
+        
+        Args:
+            rendezvous_key: 16-character hex rendezvous key (NOT the full URL)
+            
+        Returns:
+            Node information dict if found, None otherwise
+        """
+        try:
+            # FIXED: Use rendezvous_key directly as the DHT key
+            log.info(f"Looking up rendezvous key: {rendezvous_key}")
+            result = await self.get(rendezvous_key)  # Changed from digest(rendezvous_key)
+            
+            if result:
+                # Parse stored announcement
+                try:
+                    announcement = json.loads(result) if isinstance(result, str) else result
+                    
+                    # Verify epoch is recent (within overlap window)
+                    current_epoch = self.epoch_manager.get_current_epoch()
+                    announcement_epoch = announcement.get('epoch', 0)
+                    
+                    # Accept if current epoch or previous epoch
+                    if announcement_epoch >= current_epoch - 1:
+                        log.info(f"Found node via rendezvous key: {rendezvous_key}")
+                        return announcement
+                    else:
+                        log.warning(f"Found stale announcement for {rendezvous_key} (epoch {announcement_epoch} vs {current_epoch})")
+                        return None
+                        
+                except (json.JSONDecodeError, KeyError) as e:
+                    log.error(f"Failed to parse announcement: {e}")
+                    return None
+            
+            log.debug(f"No node found for rendezvous key: {rendezvous_key}")
+            return None
+            
+        except Exception as e:
+            log.error(f"Error looking up rendezvous key {rendezvous_key}: {e}")
+            return None
+
+    async def resolve_rwp_url(self, rwp_url: str) -> Optional[Dict]:
+        """
+        Resolve an RWP URL to find the target node.
+        Format: rwp://rendezvous_key/content
+        
+        Args:
+            rwp_url: RWP URL string
+            
+        Returns:
+            Dict with 'node_info' and 'content' if successful, None otherwise
+        """
+        try:
+            # Parse URL
+            if not rwp_url.startswith("rwp://"):
+                log.error(f"Invalid RWP URL format: {rwp_url}")
+                return None
+            
+            url_part = rwp_url[6:]  # Remove 'rwp://'
+            
+            # Extract rendezvous key and content
+            if '/' in url_part:
+                rendezvous_key, content = url_part.split('/', 1)
+            else:
+                rendezvous_key = url_part
+                content = ""
+            
+            log.info(f"Resolving RWP URL: rdv_key={rendezvous_key}, content={content}")
+            
+            # Look up node by rendezvous key
+            node_info = await self.lookup_by_rendezvous_key(rendezvous_key)
+            
+            if node_info:
+                log.info(f"Successfully resolved {rwp_url} to node {node_info['node_id']}")
+                return {
+                    'node_info': node_info,
+                    'content': content,
+                    'rendezvous_key': rendezvous_key
+                }
+            
+            log.warning(f"Failed to resolve {rwp_url}")
+            return None
+            
+        except Exception as e:
+            log.error(f"Error resolving RWP URL {rwp_url}: {e}")
+            return None
+
+    def _schedule_rendezvous_announcement(self):
+        """Schedule periodic rendezvous key announcements."""
+        if not self.running:
+            return
+        
+        asyncio.ensure_future(self.announce_rendezvous_key())
+        
+        # Re-announce every epoch (minus some buffer for propagation)
+        announcement_interval = self.epoch_manager.epoch_duration - 30
+        
+        loop = asyncio.get_event_loop()
+        self.rdv_announcement_loop = loop.call_later(
+            announcement_interval,
+            self._schedule_rendezvous_announcement
+        )
+
+    async def search_by_rendezvous(self, rendezvous_key: str) -> Dict:
+        """
+        Search for a node using its rendezvous key with fallback strategies.
+        
+        Args:
+            rendezvous_key: The rendezvous key to search for
+            
+        Returns:
+            Dict with search results and node info
+        """
+        search_start = time.time()
+        
+        # Strategy 1: Direct DHT lookup
+        node_info = await self.lookup_by_rendezvous_key(rendezvous_key)
+        if node_info:
+            return {
+                'found': True,
+                'method': 'dht_lookup',
+                'node_info': node_info,
+                'search_time': time.time() - search_start
+            }
+        
+        # Strategy 2: Check local routing table
+        local_nodes = self.find_node_by_rendezvous_key(rendezvous_key)
+        if local_nodes:
+            return {
+                'found': True,
+                'method': 'local_routing_table',
+                'node_info': {
+                    'node_id': local_nodes[0].id.hex(),
+                    'ip': local_nodes[0].ip,
+                    'port': local_nodes[0].port,
+                    'rwp_port': local_nodes[0].rwp_port,
+                    'rendezvous_key': rendezvous_key
+                },
+                'search_time': time.time() - search_start
+            }
+        
+        # Strategy 3: Try previous epoch key
+        # (In case announcement from previous epoch hasn't expired)
+        previous_epoch = self.epoch_manager.get_current_epoch() - 1
+        # Note: Would need node_id to recalculate, so this is limited
+        
+        return {
+            'found': False,
+            'method': 'exhausted',
+            'node_info': None,
+            'search_time': time.time() - search_start
+        }
+
     def _schedule_sync_heartbeat(self):
         """Schedule the next synchronized heartbeat."""
         if not self.running:
@@ -3487,21 +3709,38 @@ class RRKDHT:
             log.warning("There are no known neighbors to set key %s", dkey.hex())
             return False
 
-        spider = NodeSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
-        nodes = await spider.find()
-        log.info("Setting '%s' on %s", dkey.hex(), list(map(str, nodes)))
+        # FIXED: Disable learning during spider crawl to prevent cascading discoveries
+        old_learning = self.protocol.learning_enabled
+        self.protocol.learning_enabled = False
+        
+        try:
+            spider = NodeSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
+            nodes = await spider.find()
+            log.info("Setting '%s' on %s", dkey.hex(), list(map(str, nodes)))
 
-        # Store locally if this node is close enough
-        biggest = max([n.distance_to(node) for n in nodes])
-        if self.node.distance_to(node) < biggest:
-            # Store with current epoch
-            current_epochs = self.epoch_manager.get_storage_epochs()
-            for epoch in current_epochs:
-                epoch_key = self.protocol._get_epoch_key(dkey, epoch)
-                self.storage[epoch_key] = value
+            # Store locally if this node is close enough
+            biggest = max([n.distance_to(node) for n in nodes])
+            if self.node.distance_to(node) < biggest:
+                # Store with current epoch
+                current_epochs = self.epoch_manager.get_storage_epochs()
+                for epoch in current_epochs:
+                    epoch_key = self.protocol._get_epoch_key(dkey, epoch)
+                    self.storage[epoch_key] = value
 
-        results = [self.protocol.call_store(n, dkey, value) for n in nodes]
-        return any(await asyncio.gather(*results))
+            # FIXED: Limit concurrent store operations
+            results = []
+            for i in range(0, len(nodes), 3):  # Process in batches of 3
+                batch = nodes[i:i+3]
+                batch_results = await asyncio.gather(
+                    *[self.protocol.call_store(n, dkey, value) for n in batch]
+                )
+                results.extend(batch_results)
+                
+            return any(results)
+            
+        finally:
+            # Restore learning setting
+            self.protocol.learning_enabled = old_learning
 
     def save_state(self, fname):
         """Save the state of this node to a cache file."""
