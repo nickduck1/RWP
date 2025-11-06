@@ -707,6 +707,33 @@ class RRKDHTServerManager:
                     elif command == 'debug':
                         self.display_comprehensive_debug()
                     
+                    elif command.startswith('resolve '):
+                        parts = command.split(maxsplit=1)
+                        if len(parts) >= 2:
+                            rwp_url = parts[1].strip()
+                            asyncio.run_coroutine_threadsafe(
+                                self.resolve_rwp_command(rwp_url),
+                                self.loop
+                            )
+                        else:
+                            print("Usage: resolve <rwp_url>")
+
+                    elif command.startswith('lookup-rdv '):
+                        parts = command.split()
+                        if len(parts) >= 2:
+                            rdv_key = parts[1].strip()
+                            asyncio.run_coroutine_threadsafe(
+                                self.lookup_rdv_command(rdv_key),
+                                self.loop
+                            )
+                        else:
+                            print("Usage: lookup-rdv <rendezvous_key>")
+
+                    elif command == 'announce':
+                        asyncio.run_coroutine_threadsafe(
+                            self.announce_rdv_command(),
+                            self.loop
+                        )                    
                     elif command.startswith('ping '):
                         parts = command.split()
                         if len(parts) >= 3:
@@ -811,6 +838,116 @@ class RRKDHTServerManager:
             
         except Exception as e:
             print(f"❌ Search error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def resolve_rwp_command(self, rwp_url: str):
+        """Resolve an RWP URL and display results."""
+        print(f"\nResolving RWP URL: {rwp_url}")
+        print("=" * 60)
+        
+        try:
+            result = await self.dht_node.resolve_rwp_url(rwp_url)
+            
+            if result:
+                print("✓ RESOLVED")
+                print(f"\nNode Information:")
+                node_info = result['node_info']
+                print(f"  Node ID: {node_info['node_id']}")
+                print(f"  Address: {node_info['ip']}:{node_info['port']}")
+                print(f"  RWP Port: {node_info['rwp_port']}")
+                print(f"  Epoch: {node_info['epoch']}")
+                print(f"  Rendezvous Key: {result['rendezvous_key']}")
+                
+                if result['content']:
+                    print(f"\nContent Path: {result['content']}")
+                else:
+                    print(f"\nContent Path: (empty)")
+            else:
+                print("✗ NOT FOUND")
+                print("The rendezvous key may be:")
+                print("  • Expired (old epoch)")
+                print("  • Not announced to the DHT")
+                print("  • From a node that is offline")
+            
+            print("=" * 60 + "\n")
+            
+        except Exception as e:
+            print(f"✗ Resolution error: {e}")
+
+    async def announce_rdv_command(self):
+        """Manually trigger rendezvous key announcement."""
+        print(f"\nAnnouncing rendezvous key...")
+        
+        try:
+            success = await self.dht_node.announce_rendezvous_key()
+            
+            if success:
+                print(f"✓ Successfully announced rendezvous key")
+                print(f"  Key: {self.dht_node.rwp_handler.rendezvous_key}")
+                print(f"  Epoch: {self.dht_node.epoch_manager.get_current_epoch()}")
+                print(f"  RWP URL: rwp://{self.dht_node.rwp_handler.rendezvous_key}/")
+            else:
+                print(f"✗ Failed to announce rendezvous key")
+        
+        except Exception as e:
+            print(f"✗ Announcement error: {e}")
+
+    async def lookup_rdv_command(self, rdv_key: str):
+        """Look up a node by rendezvous key."""
+        # FIXED: Handle both formats (with or without rwp:// prefix)
+        if rdv_key.startswith("rwp://"):
+            # Extract just the rendezvous key
+            url_part = rdv_key[6:]
+            if '/' in url_part:
+                rdv_key, _ = url_part.split('/', 1)
+            else:
+                rdv_key = url_part
+        
+        print(f"\nLooking up rendezvous key: {rdv_key}")
+        print("=" * 60)
+        
+        try:
+            result = await self.dht_node.search_by_rendezvous(rdv_key)
+            
+            if result['found']:
+                print(f"✓ FOUND via {result['method']}")
+                print(f"Search time: {result['search_time']:.3f}s")
+                
+                node_info = result['node_info']
+                print(f"\nNode Information:")
+                print(f"  Node ID: {node_info['node_id']}")
+                print(f"  Address: {node_info['ip']}:{node_info['port']}")
+                print(f"  RWP Port: {node_info.get('rwp_port', 'N/A')}")
+                
+                if 'epoch' in node_info:
+                    print(f"  Epoch: {node_info['epoch']}")
+                if 'timestamp' in node_info:
+                    age = time.time() - node_info['timestamp']
+                    print(f"  Announcement age: {age:.1f}s")
+                
+                # Show the working RWP URL
+                print(f"\nRWP URL: rwp://{rdv_key}/")
+            else:
+                print(f"✗ NOT FOUND")
+                print(f"Search time: {result['search_time']:.3f}s")
+                print(f"Method: {result['method']}")
+                
+                # Helpful debug info
+                current_epoch = self.dht_node.epoch_manager.get_current_epoch()
+                print(f"\nDebug Info:")
+                print(f"  Current Epoch: {current_epoch}")
+                print(f"  Your Rendezvous Key: {self.dht_node.rwp_handler.rendezvous_key}")
+                print(f"\nPossible reasons:")
+                print(f"  • Node hasn't announced this key yet")
+                print(f"  • Key is from wrong epoch")
+                print(f"  • Node is offline or unreachable")
+                print(f"  • Not enough nodes to propagate the announcement")
+            
+            print("=" * 60 + "\n")
+            
+        except Exception as e:
+            print(f"✗ Lookup error: {e}")
             import traceback
             traceback.print_exc()
 
