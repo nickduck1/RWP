@@ -22,7 +22,7 @@ What’s Left:
 - The only thing remaining in the Core is implementing the rendezvous_key search/find feature. (DONE)
 - Integrate the real server (not tserver.py), with the core (RRKDHT.py).
 
-Interrupted integration, Because there is a replication issue. (Easy fix, But working on it.)
+Interrupted integration, Because Ive made a big mistake. (Easy fix, But working on it. May take time!)
 
 Note:
 It may take a while to be ready for real use (production), Because i have studies and AI is not that good in helping.
