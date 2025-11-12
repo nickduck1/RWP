@@ -140,10 +140,10 @@ class MessageType(Enum):
     NODE_INFO = "node_info"
     NODE_INFO_RESPONSE = "node_info_response"
     FIND_NODE = "find_node"
-    FIND_VALUE = "find_value"
-    STORE = "store"
     HEARTBEAT = "heartbeat"
-
+    DHT_GET = "dht_get"  # Add this
+    DHT_SET = "dht_set"  # Add this
+    
 @dataclass
 class Message:
     """RWP protocol message structure."""
@@ -251,116 +251,6 @@ class SecureMessaging:
             return obj.__dict__
         else:
             raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-# ============================================================================
-# STORAGE CLASSES
-# ============================================================================
-
-class IStorage(ABC):
-    """Local storage for this node."""
-
-    @abstractmethod
-    def __setitem__(self, key, value):
-        """Set a key to the given value."""
-
-    @abstractmethod
-    def __getitem__(self, key):
-        """Get the given key. If item doesn't exist, raises KeyError"""
-
-    @abstractmethod
-    def get(self, key, default=None):
-        """Get given key. If not found, return default."""
-
-    @abstractmethod
-    def iter_older_than(self, seconds_old):
-        """Return iterator over (key, value) tuples for items older than secondsOld."""
-
-    @abstractmethod
-    def __iter__(self):
-        """Get the iterator for this storage, should yield tuple of (key, value)"""
-
-    @abstractmethod
-    def get_debug_info(self):
-        """Get debug information about storage contents."""
-
-class ForgetfulStorage(IStorage):
-    """Storage implementation that forgets old entries after TTL expires."""
-    
-    def __init__(self, ttl=604800):
-        """By default, max age is a week."""
-        self.data = OrderedDict()
-        self.ttl = ttl
-        self._lock = threading.RLock()
-
-    def __setitem__(self, key, value):
-        with self._lock:
-            if key in self.data:
-                del self.data[key]
-            self.data[key] = (time.monotonic(), value)
-            self.cull()
-
-    def cull(self):
-        """Remove expired entries."""
-        for _, _ in self.iter_older_than(self.ttl):
-            self.data.popitem(last=False)
-
-    def get(self, key, default=None):
-        with self._lock:
-            self.cull()
-            if key in self.data:
-                return self[key]
-            return default
-
-    def __getitem__(self, key):
-        with self._lock:
-            self.cull()
-            return self.data[key][1]
-
-    def __repr__(self):
-        with self._lock:
-            self.cull()
-            return repr(self.data)
-
-    def iter_older_than(self, seconds_old):
-        with self._lock:
-            min_birthday = time.monotonic() - seconds_old
-            zipped = self._triple_iter()
-            matches = takewhile(lambda r: min_birthday >= r[1], zipped)
-            return list(map(operator.itemgetter(0, 2), matches))
-
-    def _triple_iter(self):
-        ikeys = self.data.keys()
-        ibirthday = map(operator.itemgetter(0), self.data.values())
-        ivalues = map(operator.itemgetter(1), self.data.values())
-        return zip(ikeys, ibirthday, ivalues)
-
-    def __iter__(self):
-        with self._lock:
-            self.cull()
-            ikeys = self.data.keys()
-            ivalues = map(operator.itemgetter(1), self.data.values())
-            return zip(ikeys, ivalues)
-
-    def get_debug_info(self):
-        """Get debug information about storage contents."""
-        with self._lock:
-            self.cull()
-            debug_info = {
-                'total_items': len(self.data),
-                'ttl_seconds': self.ttl,
-                'items': []
-            }
-            
-            for key, (timestamp, value) in self.data.items():
-                age = time.monotonic() - timestamp
-                debug_info['items'].append({
-                    'key': key.hex() if isinstance(key, bytes) else str(key),
-                    'value': str(value)[:100],  # Truncate long values
-                    'age_seconds': int(age),
-                    'expires_in': int(self.ttl - age)
-                })
-            
-            return debug_info
 
 # ============================================================================
 # NODE CLASSES
@@ -953,22 +843,23 @@ class RWPProtocolHandler:
         self._send_rwp_response(client_socket, status_code, message)
     
     def get_node_info(self, ip: str, rwp_port: int) -> Optional[NodeInfo]:
-        """Enhanced get_node_info with better error handling and retry logic."""
+        """Enhanced get_node_info with better error handling and caching."""
         cache_key = f"{ip}:{rwp_port}"
         
         with self.cache_lock:
             if cache_key in self.node_info_cache:
                 cached_info = self.node_info_cache[cache_key]
-                if not cached_info.is_expired():
+                # Use shorter expiration for more frequent refresh (30 seconds instead of 3600)
+                if time.time() - cached_info.timestamp < 30:
                     return cached_info
                 else:
                     del self.node_info_cache[cache_key]
         
         # Try multiple times with exponential backoff
-        for attempt in range(3):
+        for attempt in range(2):  # Reduced from 3 to 2 attempts
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(Config.RWP_TIMEOUT)
+                sock.settimeout(3.0)  # Reduced from Config.RWP_TIMEOUT
                 
                 # Connect with timeout
                 sock.connect((ip, rwp_port))
@@ -982,7 +873,7 @@ class RWPProtocolHandler:
                 
                 # Receive response with proper buffering
                 response_data = b""
-                sock.settimeout(5.0)  # Shorter timeout for reading
+                sock.settimeout(2.0)  # Shorter timeout for reading
                 
                 while True:
                     try:
@@ -1016,7 +907,7 @@ class RWPProtocolHandler:
                         node_info = NodeInfo(
                             node_id=node_data['node_id'],
                             ip=ip,
-                            port=0,  # Not provided in node info
+                            port=0,
                             rwp_port=rwp_port,
                             rendezvous_key=node_data['rendezvous_key'],
                             signing_public_key=node_data['signing_public_key'],
@@ -1035,14 +926,14 @@ class RWPProtocolHandler:
                         log.error(f"Failed to parse node info response: {e}")
                         raise
                 else:
-                    log.warning(f"Invalid response from {ip}:{rwp_port}: {response_str[:100]}")
+                    log.warning(f"Invalid response from {ip}:{rwp_port}")
                     raise ConnectionError("Invalid response")
                     
             except (socket.timeout, socket.error, OSError, ConnectionError, ValueError) as e:
-                log.warning(f"Attempt {attempt + 1} failed to get node info from {ip}:{rwp_port}: {e}")
-                if attempt < 2:  # Don't sleep on last attempt
-                    time.sleep(0.5 * (2 ** attempt))  # Exponential backoff
-                continue
+                if attempt < 1:  # Don't sleep on last attempt
+                    time.sleep(0.2 * (attempt + 1))  # Shorter backoff
+                    continue
+                log.debug(f"Failed to get node info from {ip}:{rwp_port}: {e}")
             except Exception as e:
                 log.error(f"Unexpected error getting node info from {ip}:{rwp_port}: {e}")
                 break
@@ -1053,7 +944,6 @@ class RWPProtocolHandler:
                 except:
                     pass
         
-        log.error(f"All attempts failed to get node info from {ip}:{rwp_port}")
         return None
     
     def send_encrypted_message(self, node_info: NodeInfo, message_type: MessageType, 
@@ -1181,10 +1071,9 @@ class RWPProtocolHandler:
 class RRKDHTProtocol(RPCProtocol):
     """Enhanced Kademlia protocol with RWP support and key rotation."""
     
-    def __init__(self, source_node, storage, ksize, epoch_manager, rwp_handler):
+    def __init__(self, source_node, ksize, epoch_manager, rwp_handler):
         RPCProtocol.__init__(self)
         self.router = RoutingTable(self, ksize, source_node)
-        self.storage = storage
         self.source_node = source_node
         self.epoch_manager = epoch_manager
         self.rwp_handler = rwp_handler
@@ -1228,22 +1117,6 @@ class RRKDHTProtocol(RPCProtocol):
                 }
                 log.debug(f"Tracked possible responsible: {node.ip}:{node.port}")
 
-    def rpc_store(self, sender, nodeid, key, value, rwp_port=None):
-        """Enhanced store that includes rwp_port - MINIMAL CHANGE."""
-        log.debug(f"Received store from {sender} with nodeid {nodeid.hex()}, key {key.hex()}, and rwp_port {rwp_port}")
-        source = Node(nodeid, sender[0], sender[1], rwp_port)
-        self.welcome_if_new(source)
-        
-        # Store with epoch-based key rotation (UNCHANGED)
-        current_epochs = self.epoch_manager.get_storage_epochs()
-        for epoch in current_epochs:
-            epoch_key = self._get_epoch_key(key, epoch)
-            log.debug(f"Storing key {epoch_key.hex()} for epoch {epoch}")
-            self.storage[epoch_key] = value
-        
-        log.debug(f"Store operation completed successfully")
-        return True
-
     def rpc_find_node(self, sender, nodeid, key, rwp_port=None):
         """Enhanced find_node that returns neighbors closest to the TARGET key."""
         log.debug(f"Received find_node from {sender} with nodeid {nodeid.hex()}, "
@@ -1283,24 +1156,6 @@ class RRKDHTProtocol(RPCProtocol):
             for n in closest
         ]
 
-    def rpc_find_value(self, sender, nodeid, key, rwp_port=None):
-        """Enhanced find_value that includes rwp_port - MINIMAL CHANGE."""
-        log.debug(f"Received find_value from {sender} with nodeid {nodeid.hex()}, key {key.hex()}, and rwp_port {rwp_port}")
-        source = Node(nodeid, sender[0], sender[1], rwp_port)
-        self.welcome_if_new(source)
-        
-        # Try to find value in current and previous epochs (UNCHANGED)
-        retrieval_epochs = self.epoch_manager.get_retrieval_epochs()
-        for epoch in retrieval_epochs:
-            epoch_key = self._get_epoch_key(key, epoch)
-            value = self.storage.get(epoch_key, None)
-            if value is not None:
-                log.debug(f"Found value for key {epoch_key.hex()} in epoch {epoch}")
-                return {"value": value}
-        
-        log.debug(f"Value not found, returning neighbors")
-        return self.rpc_find_node(sender, nodeid, key, rwp_port)
-
     def rpc_verify_neighbor(self, sender, nodeid, target_id, rwp_port=None):
         """
         Verify if we have target_id in our routing table.
@@ -1320,7 +1175,7 @@ class RRKDHTProtocol(RPCProtocol):
         return False
 
     def _get_epoch_key(self, key, epoch):
-        """Generate epoch-specific storage key."""
+        """Generate epoch-specific key."""
         epoch_data = f"{key.hex()}:epoch:{epoch}"
         return digest(epoch_data)
 
@@ -1407,172 +1262,6 @@ class RRKDHTProtocol(RPCProtocol):
         else:
             log.warning(f"Both UDP and RWP failed for find_node to {node_to_ask.ip}")
             return (False, None)
-
-    async def call_find_value(self, node_to_ask, node_to_find):
-        """Enhanced find_value call with proper timeout cleanup."""
-        log.debug(f"Calling find_value on {node_to_ask.ip}:{node_to_ask.port} (RWP: {node_to_ask.rwp_port}) for key {node_to_find.id.hex()}")
-        
-        # Try UDP first with timeout and retry logic
-        udp_success = False
-        result = None
-        
-        try:
-            address = (node_to_ask.ip, node_to_ask.port)
-            log.debug(f"Attempting UDP find_value to {address}")
-            
-            try:
-                result = await asyncio.wait_for(
-                    self.find_value(address, self.source_node.id, node_to_find.id, self.source_node.rwp_port),
-                    timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                log.warning(f"call_find_value timed out to {address}")
-                # CLEANUP: prevent rpcudp._timeout from touching a cancelled future
-                for mid, (future, timeout_handle) in list(self._outstanding.items()):
-                    if future.done() or future.cancelled():
-                        timeout_handle.cancel()
-                        del self._outstanding[mid]
-                return (False, None)
-
-            # Enhanced result validation and logging
-            if result:
-                log.debug(f"UDP find_value raw result: {result}")
-                if result[0]:
-                    udp_success = True
-                    if isinstance(result[1], dict) and 'value' in result[1]:
-                        log.debug(f"UDP find_value successful - found value")
-                    else:
-                        log.debug(f"UDP find_value successful - got {len(result[1]) if result[1] else 0} nodes")
-                else:
-                    log.warning(f"UDP find_value returned failure response: success={result[0]}, data={result[1]}")
-            else:
-                log.warning(f"UDP find_value returned None/empty result")
-                
-        except Exception as e:
-            log.error(f"Unexpected error in UDP find_value to {node_to_ask.ip}:{node_to_ask.port}: {type(e).__name__}: {e}")
-            # Clean up on any exception
-            for mid, (future, timeout_handle) in list(self._outstanding.items()):
-                if future.done() or future.cancelled():
-                    timeout_handle.cancel()
-                    del self._outstanding[mid]
-        
-        # If UDP failed, try RWP fallback
-        if not udp_success and node_to_ask.rwp_port:
-            log.info(f"UDP failed, attempting RWP fallback to {node_to_ask.ip}:{node_to_ask.rwp_port}")
-            try:
-                node_info = self.rwp_handler.get_node_info(node_to_ask.ip, node_to_ask.rwp_port)
-                if node_info:
-                    response = self.rwp_handler.send_encrypted_message(
-                        node_info,
-                        MessageType.FIND_VALUE,
-                        {'key': node_to_find.id.hex()}
-                    )
-                    if response and response.get('payload', {}).get('success'):
-                        if response['payload'].get('found'):
-                            log.debug(f"RWP find_value found value")
-                            return (True, {"value": response['payload'].get('value')})
-                        else:
-                            nodes = []
-                            for node_data in response['payload'].get('nodes', []):
-                                node = Node(
-                                    bytes.fromhex(node_data['id']),
-                                    node_data['ip'],
-                                    node_data['port'],
-                                    node_data.get('rwp_port'),
-                                    node_data.get('rendezvous_key')
-                                )
-                                nodes.append(node)
-                                
-                                # Add discovered nodes to routing table
-                                self.welcome_if_new(node)
-                                
-                            log.debug(f"RWP find_value returned {len(nodes)} nodes")
-                            return (True, list(map(tuple, nodes)))
-                    else:
-                        log.warning(f"RWP find_value unsuccessful response: {response}")
-            except Exception as e:
-                log.error(f"RWP fallback also failed: {type(e).__name__}: {e}")
-        
-        # Return UDP result if successful, otherwise return failure
-        if udp_success:
-            return self.handle_call_response(result, node_to_ask)
-        else:
-            log.warning(f"Both UDP and RWP failed for find_value to {node_to_ask.ip}")
-            return (False, None)
-
-    async def call_store(self, node_to_ask, key, value):
-        """Enhanced store call with proper timeout cleanup."""
-        log.debug(f"Calling store on {node_to_ask.ip}:{node_to_ask.port} (RWP: {node_to_ask.rwp_port}) for key {key.hex()}")
-        
-        # Try UDP first with timeout and retry logic
-        udp_success = False
-        result = None
-        
-        try:
-            address = (node_to_ask.ip, node_to_ask.port)
-            log.debug(f"Attempting UDP store to {address}")
-            try:
-                result = await asyncio.wait_for(
-                    self.store(address, self.source_node.id, key, value, self.source_node.rwp_port),
-                    timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                log.warning(f"call_store timed out to {address}")
-                # CLEANUP: prevent rpcudp._timeout from touching a cancelled future
-                for mid, (future, timeout_handle) in list(self._outstanding.items()):
-                    if future.done() or future.cancelled():
-                        timeout_handle.cancel()
-                        del self._outstanding[mid]
-                return (False, False)
-
-            # Enhanced result validation and logging
-            if result:
-                log.debug(f"UDP store raw result: {result}")
-                if result[0]:
-                    udp_success = True
-                    log.debug(f"UDP store successful - result: {result[1]}")
-                else:
-                    log.warning(f"UDP store returned failure response: success={result[0]}, data={result[1]}")
-            else:
-                log.warning(f"UDP store returned None/empty result")
-                
-        except Exception as e:
-            log.error(f"Unexpected error in UDP store to {node_to_ask.ip}:{node_to_ask.port}: {type(e).__name__}: {e}")
-            # Clean up on any exception
-            for mid, (future, timeout_handle) in list(self._outstanding.items()):
-                if future.done() or future.cancelled():
-                    timeout_handle.cancel()
-                    del self._outstanding[mid]
-        
-        # If UDP failed, try RWP fallback
-        if not udp_success and node_to_ask.rwp_port:
-            log.info(f"UDP failed, attempting RWP fallback to {node_to_ask.ip}:{node_to_ask.rwp_port}")
-            try:
-                node_info = self.rwp_handler.get_node_info(node_to_ask.ip, node_to_ask.rwp_port)
-                if node_info:
-                    response = self.rwp_handler.send_encrypted_message(
-                        node_info,
-                        MessageType.STORE,
-                        {
-                            'key': key.hex(),
-                            'value': value,
-                            'timestamp': time.time()
-                        }
-                    )
-                    if response and response.get('payload', {}).get('success'):
-                        log.debug(f"RWP store successful to {node_to_ask.ip}:{node_to_ask.rwp_port}")
-                        return (True, True)
-                    else:
-                        log.warning(f"RWP store unsuccessful response: {response}")
-            except Exception as e:
-                log.error(f"RWP fallback also failed: {type(e).__name__}: {e}")
-        
-        # Return UDP result if successful, otherwise return failure
-        if udp_success:
-            return self.handle_call_response(result, node_to_ask)
-        else:
-            log.warning(f"Both UDP and RWP failed for store to {node_to_ask.ip}")
-            return (False, False)
 
     async def call_ping(self, node_to_ask):
         """Enhanced ping call with proper timeout cleanup."""
@@ -1680,7 +1369,9 @@ class RRKDHTProtocol(RPCProtocol):
             return (False, False)
 
     def welcome_if_new(self, node):
-        """Enhanced welcome with duplicate prevention and neighbor limit respect."""
+        """
+        Enhanced welcome with duplicate prevention
+        """
         # Skip if it's ourselves
         if node.id == self.source_node.id:
             return
@@ -1708,39 +1399,8 @@ class RRKDHTProtocol(RPCProtocol):
             if node_info:
                 # Update node with rendezvous key
                 node.rendezvous_key = node_info.rendezvous_key
-
-        # FIXED: Only replicate data if node will actually be added to routing table
-        # Check if we should accept this node BEFORE replicating data
-        if not self.router.should_accept_new_neighbor(node):
-            log.debug(f"Not replicating data to {node} - won't be added to routing table")
-            return
         
-        # Send stored values that the new node should have
-        # FIXED: Limit the number of concurrent replication operations
-        replication_tasks = []
-        max_replications = 10  # Limit concurrent replications
-        
-        for key, value in self.storage:
-            if len(replication_tasks) >= max_replications:
-                break  # Don't overwhelm the network
-                
-            keynode = Node(digest(key))
-            neighbors = self.router.find_neighbors(keynode)
-            if neighbors:
-                last = neighbors[-1].distance_to(keynode)
-                new_node_close = node.distance_to(keynode) < last
-                first = neighbors[0].distance_to(keynode)
-                this_closest = self.source_node.distance_to(keynode) < first
-            if not neighbors or (new_node_close and this_closest):
-                replication_tasks.append(self.call_store(node, key, value))
-        
-        # Schedule replications but don't wait for them
-        if replication_tasks:
-            log.debug(f"Scheduling {len(replication_tasks)} replication operations to {node}")
-            for task in replication_tasks:
-                asyncio.ensure_future(task)
-        
-        # Add contact to routing table
+        # Add to routing table
         self.router.add_contact(node)
 
     def _find_existing_node(self, target_node):
@@ -2349,19 +2009,13 @@ class RoutingTable:
 # ============================================================================
 
 class RPCFindResponse:
-    """Wrapper for RPC find responses."""
+    """Wrapper for RPC find responses"""
     
     def __init__(self, response):
         self.response = response
 
     def happened(self):
         return self.response[0]
-
-    def has_value(self):
-        return isinstance(self.response[1], dict)
-
-    def get_value(self):
-        return self.response[1]["value"]
 
     def get_node_list(self):
         """Handle both 3-tuple and 4-tuple formats."""
@@ -2410,67 +2064,19 @@ class SpiderCrawl:
         return await self._nodes_found(found)
 
     async def _nodes_found(self, responses):
+        """Process node responses - NO VALUE HANDLING."""
         toremove = []
-        found_values = []
         for peerid, response in responses.items():
             response = RPCFindResponse(response)
             if not response.happened():
                 toremove.append(peerid)
-            elif response.has_value():
-                found_values.append(response.get_value())
             else:
-                peer = self.nearest.get_node(peerid)
-                self.nearest_without_value.push(peer)
                 self.nearest.push(response.get_node_list())
         self.nearest.remove(toremove)
 
-        if found_values:
-            return await self._handle_found_values(found_values)
         if self.nearest.have_contacted_all():
-            return None
+            return list(self.nearest)
         return await self.find()
-
-class ValueSpiderCrawl(SpiderCrawl):
-    """Enhanced value spider crawl with epoch support."""
-    
-    def __init__(self, protocol, node, peers, ksize, alpha):
-        SpiderCrawl.__init__(self, protocol, node, peers, ksize, alpha)
-        self.nearest_without_value = NodeHeap(self.node, 1)
-
-    async def find(self):
-        return await self._find(self.protocol.call_find_value)
-
-    async def _nodes_found(self, responses):
-        toremove = []
-        found_values = []
-        for peerid, response in responses.items():
-            response = RPCFindResponse(response)
-            if not response.happened():
-                toremove.append(peerid)
-            elif response.has_value():
-                found_values.append(response.get_value())
-            else:
-                peer = self.nearest.get_node(peerid)
-                self.nearest_without_value.push(peer)
-                self.nearest.push(response.get_node_list())
-        self.nearest.remove(toremove)
-
-        if found_values:
-            return await self._handle_found_values(found_values)
-        if self.nearest.have_contacted_all():
-            return None
-        return await self.find()
-
-    async def _handle_found_values(self, values):
-        value_counts = Counter(values)
-        if len(value_counts) != 1:
-            log.warning("Got multiple values for key %i: %s", self.node.long_id, str(values))
-        value = value_counts.most_common(1)[0][0]
-
-        peer = self.nearest_without_value.popleft()
-        if peer:
-            await self.protocol.call_store(peer, self.node.id, value)
-        return value
 
 class NodeSpiderCrawl(SpiderCrawl):
     """Enhanced node spider crawl."""
@@ -2516,11 +2122,6 @@ def bytes_to_bit_string(bites):
     bits = [bin(bite)[2:].rjust(8, "0") for bite in bites]
     return "".join(bits)
 
-def check_dht_value_type(value):
-    """Check if the type of the value is valid for DHT storage."""
-    typeset = [int, float, bool, str, bytes]
-    return type(value) in typeset
-
 # ============================================================================
 # MAIN RRKDHT CLASS
 # ============================================================================
@@ -2534,12 +2135,10 @@ class RRKDHT:
 
     protocol_class = RRKDHTProtocol
 
-    def __init__(self, ksize=2, alpha=3, node_id=None, storage=None, 
-                signing_keys=None, rwp_port=None):
-        """Create an RRKDHT server instance with proper DHT handler."""
+    def __init__(self, ksize=2, alpha=3, node_id=None, signing_keys=None, rwp_port=None):
+        """Create an RRKDHT server instance"""
         self.ksize = ksize
         self.alpha = alpha
-        self.storage = storage or ForgetfulStorage()
         
         # Generate or use provided signing keys
         if signing_keys:
@@ -2564,8 +2163,7 @@ class RRKDHT:
             peer_id, 
             self.messaging, 
             self.epoch_manager,
-            self.storage,
-            None
+            None  # No router yet
         )
         
         self.network_conditions = {
@@ -2581,16 +2179,16 @@ class RRKDHT:
         self.HEARTBEAT_SYNC_INTERVAL = 60
         self.MAX_FAILURES_BEFORE_REMOVAL = 3
 
-        # NEW: Track possible responsible nodes based on who contacts us
-        self.possible_responsibles = {}  # node_id -> {'node': Node, 'last_contact': timestamp, 'verified': bool}
-        self.verified_responsibles = set()  # Set of verified responsible node IDs
+        # Track possible responsible nodes
+        self.possible_responsibles = {}
+        self.verified_responsibles = set()
         self.last_responsible_check = 0
         self.is_orphaned = False
         self.rejoin_in_progress = False
         self.responsible_check_loop = None
         self._rejoin_attempts = 0
         self._identity_regeneration_count = 0
-        self._original_identity = None  # Store original identity for logging
+        self._original_identity = None
         self._pending_verification = False
 
         # Initialize protocol and other components
@@ -2617,12 +2215,9 @@ class RRKDHT:
         if hasattr(self, 'heartbeat_loop') and self.heartbeat_loop: 
             self.heartbeat_loop.cancel()
         
+        # NEW: Stop responsible node checking
         if hasattr(self, 'responsible_check_loop') and self.responsible_check_loop:
             self.responsible_check_loop.cancel()
-        
-        # NEW: Stop rendezvous announcements
-        if hasattr(self, 'rdv_announcement_loop') and self.rdv_announcement_loop:
-            self.rdv_announcement_loop.cancel()
             
         if self.rwp_handler:
             self.rwp_handler.stop_rwp_server()
@@ -2632,12 +2227,12 @@ class RRKDHT:
 
         self._rejoin_attempts = 0
         self._identity_regeneration_count = 0
-        self._pending_verification = False
+        self._pending_verification = False  
 
     def _create_protocol(self):
-        """Create protocol and set up router reference."""
+        """Create protocol"""
         protocol = self.protocol_class(
-            self.node, self.storage, self.ksize, 
+            self.node, self.ksize, 
             self.epoch_manager, self.rwp_handler
         )
         # Set the router reference for the RWP handler
@@ -2681,21 +2276,16 @@ class RRKDHT:
         
         self.transport, self.protocol = await listen
         
+        self._rendezvous_storage = {}
+        self._schedule_rendezvous_republish()
+
         # Start key rotation monitoring
         self._start_key_rotation_monitor()
-        
         # Schedule refreshing table
         self.refresh_table()
         self.start_heartbeat()
-        
         # NEW: Start responsible node checking
         self._schedule_responsible_check()
-        
-        # NEW: Start rendezvous key announcements
-        self._schedule_rendezvous_announcement()
-        
-        # NEW: Make initial announcement
-        await self.announce_rendezvous_key()
 
     def _update_network_conditions(self, ping_time, success):
         """Update network conditions based on recent ping performance."""
@@ -2943,6 +2533,570 @@ class RRKDHT:
             self._schedule_responsible_check
         )
 
+    async def store_rendezvous_key(self, rendezvous_key: str, node_id: bytes, ttl: int = None) -> bool:
+        """
+        Store a rendezvous key mapping on the node(s) with Node_ID closest to the key's hash.
+        Uses iterative search to find the actual closest nodes.
+        """
+        try:
+            # Hash the rendezvous key to get storage location
+            key_hash = digest(rendezvous_key)
+            
+            # Use epoch duration as default TTL
+            if ttl is None:
+                ttl = self.epoch_manager.epoch_duration
+            
+            # Create storage value
+            current_epoch = self.epoch_manager.get_current_epoch()
+            storage_value = {
+                'node_id': node_id.hex(),
+                'rendezvous_key': rendezvous_key,
+                'stored_at': time.time(),
+                'epoch': current_epoch,
+                'expires_at': time.time() + ttl
+            }
+            
+            log.info(f"Storing rendezvous key '{rendezvous_key}' for node {node_id.hex()[:16]}...")
+            log.debug(f"Key hash: {key_hash.hex()[:16]}...")
+            
+            # Find nodes with Node_ID closest to the key hash
+            closest_nodes = await self._find_closest_nodes_to_key(key_hash, k=Config.REPLICATION_FACTOR)
+            
+            if not closest_nodes:
+                log.error(f"Could not find any nodes to store rendezvous key")
+                return False
+            
+            log.info(f"Found {len(closest_nodes)} closest nodes for storage:")
+            target_node = Node(key_hash)
+            for i, node in enumerate(closest_nodes):
+                distance = target_node.distance_to(node)
+                is_us = " US" if node.id == self.protocol.source_node.id else ""
+                log.info(f"  {i+1}. {node.ip}:{node.port} (distance: {distance}){is_us}")
+            
+            # Store on all closest nodes
+            store_tasks = []
+            for node in closest_nodes:
+                store_tasks.append(self._store_rendezvous_on_node(node, key_hash, storage_value))
+            
+            results = await asyncio.gather(*store_tasks, return_exceptions=True)
+            
+            # Count successes and failures
+            success_count = sum(1 for r in results if r is True)
+            failed_count = len(results) - success_count
+            
+            # Calculate minimum required successes (at least 1, or majority if multiple nodes)
+            min_required = 1 if len(closest_nodes) == 1 else (len(closest_nodes) + 1) // 2
+            
+            if success_count >= min_required:
+                log.info(f"[OK] Successfully stored rendezvous key on {success_count}/{len(closest_nodes)} nodes")
+                if failed_count > 0:
+                    log.warning(f"  {failed_count} storage operations failed (acceptable)")
+                return True
+            else:
+                log.error(f"[NEGATIVE] Failed to store on enough nodes: {success_count}/{len(closest_nodes)} (needed {min_required})")
+                return False
+                
+        except Exception as e:
+            log.error(f"Error storing rendezvous key: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    async def _find_closest_nodes_to_key(self, key_hash: bytes, k: int = None) -> List[Node]:
+        """
+        Find the k nodes with Node_IDs closest to the given key hash using iterative search.
+        
+        Args:
+            key_hash: The key hash to find closest nodes for
+            k: Number of closest nodes to find (defaults to REPLICATION_FACTOR)
+        
+        Returns:
+            List of k closest nodes
+        """
+        if k is None:
+            k = Config.REPLICATION_FACTOR
+        
+        try:
+            target_node = Node(key_hash)
+            
+            # Start with our closest known neighbors
+            current_closest = self.protocol.router.find_neighbors(target_node, k=self.alpha)
+            
+            if not current_closest:
+                # If we have no neighbors, we're the only node
+                log.debug(f"No neighbors found, we are the only node for this key")
+                return [self.protocol.source_node]
+            
+            # Check if we are closer than any neighbor
+            our_distance = target_node.distance_to(self.protocol.source_node)
+            
+            queried_nodes = set()
+            best_distance = min(target_node.distance_to(n) for n in current_closest)
+            
+            # Build initial candidate list including ourselves if we're close
+            all_candidates = list(current_closest)
+            all_candidates.append(self.protocol.source_node)
+            
+            log.debug(f"Initial search - our distance: {our_distance}, best neighbor distance: {best_distance}")
+            
+            # Iteratively find closer nodes
+            improved = True
+            iteration = 0
+            
+            while improved and iteration < Config.SEARCH_MAX_HOPS:
+                iteration += 1
+                improved = False
+                
+                unqueried = [n for n in current_closest if n.id not in queried_nodes]
+                
+                if not unqueried:
+                    log.debug(f"No more unqueried nodes after {iteration} iterations")
+                    break
+                
+                # Query alpha nodes in parallel
+                nodes_to_query = unqueried[:self.alpha]
+                
+                query_tasks = []
+                for node in nodes_to_query:
+                    queried_nodes.add(node.id)
+                    query_tasks.append(self._query_node_for_closest(node, key_hash))
+                
+                results = await asyncio.gather(*query_tasks, return_exceptions=True)
+                
+                new_neighbors = []
+                for result in results:
+                    if isinstance(result, list):
+                        new_neighbors.extend(result)
+                
+                if new_neighbors:
+                    # Add new neighbors to candidates
+                    all_candidates.extend(new_neighbors)
+                    
+                    # Merge with current_closest and remove duplicates
+                    all_nodes = current_closest + new_neighbors
+                    unique_nodes = {n.id: n for n in all_nodes if n.id not in queried_nodes}
+                    
+                    # Sort by distance and keep closest
+                    current_closest = sorted(
+                        unique_nodes.values(),
+                        key=lambda n: target_node.distance_to(n)
+                    )[:self.alpha * 2]
+                    
+                    # Check if we found closer nodes
+                    new_best = target_node.distance_to(current_closest[0]) if current_closest else float('inf')
+                    if new_best < best_distance:
+                        best_distance = new_best
+                        improved = True
+                        log.debug(f"Iteration {iteration}: Found closer nodes, best distance now: {best_distance}")
+            
+            # Remove duplicates from all candidates
+            unique_candidates = {n.id: n for n in all_candidates}
+            
+            # Sort by distance and return k closest
+            sorted_candidates = sorted(
+                unique_candidates.values(),
+                key=lambda n: target_node.distance_to(n)
+            )[:k]
+            
+            log.debug(f"Found {len(sorted_candidates)} closest nodes after {iteration} iterations")
+            
+            # Log the final distances
+            for i, node in enumerate(sorted_candidates):
+                distance = target_node.distance_to(node)
+                is_us = " (US)" if node.id == self.protocol.source_node.id else ""
+                log.debug(f"  Closest node {i+1}: {node.ip}:{node.port} (distance: {distance}){is_us}")
+            
+            return sorted_candidates
+            
+        except Exception as e:
+            log.error(f"Error finding closest nodes: {e}")
+            # Return ourselves as fallback
+            return [self.protocol.source_node]
+
+    async def _query_node_for_closest(self, node: Node, key_hash: bytes) -> List[Node]:
+        """Query a node for nodes closest to the key hash."""
+        try:
+            result = await self.protocol.call_find_node(node, Node(key_hash))
+            
+            if not result[0]:
+                return []
+            
+            neighbors = []
+            if result[1]:
+                for node_tuple in result[1]:
+                    if len(node_tuple) >= 3:
+                        returned_id, ip, port = node_tuple[:3]
+                        rwp_port = node_tuple[3] if len(node_tuple) > 3 else None
+                        neighbors.append(Node(returned_id, ip, port, rwp_port))
+            
+            return neighbors
+            
+        except Exception as e:
+            log.debug(f"Error querying node {node.ip}:{node.port}: {e}")
+            return []
+
+    async def _store_rendezvous_on_node(self, node: Node, key_hash: bytes, value: Dict) -> bool:
+        """Store rendezvous key data on a specific node with retry logic."""
+        max_retries = 2
+        retry_delay = 0.5
+        
+        try:
+            # Check if this is us - compare by Node ID
+            if node.id == self.protocol.source_node.id:
+                log.debug(f"Storing locally (we are the target node)")
+                return await self._store_local_rendezvous(key_hash, value)
+            
+            # Try RWP for remote nodes with retries
+            if not node.rwp_port:
+                log.debug(f"Node {node.ip}:{node.port} has no RWP port")
+                return False
+            
+            for attempt in range(max_retries):
+                try:
+                    node_info = self.rwp_handler.get_node_info(node.ip, node.rwp_port)
+                    if not node_info:
+                        if attempt < max_retries - 1:
+                            log.debug(f"Could not get node info for {node.ip}:{node.rwp_port}, retrying...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            log.warning(f"Could not get node info for {node.ip}:{node.rwp_port} after {max_retries} attempts")
+                            return False
+                    
+                    response = self.rwp_handler.send_encrypted_message(
+                        node_info,
+                        MessageType.DHT_SET,
+                        {
+                            'key': key_hash.hex(),
+                            'value': json.dumps(value),
+                            'ttl': int(value['expires_at'] - value['stored_at'])
+                        }
+                    )
+                    
+                    if response:
+                        # Check response format
+                        success = False
+                        if isinstance(response, dict):
+                            payload = response.get('payload', {})
+                            success = payload.get('success', False)
+                        
+                        if success:
+                            log.info(f"[OK] Successfully stored on remote node {node.ip}:{node.port}")
+                            return True
+                        else:
+                            if attempt < max_retries - 1:
+                                log.debug(f"Store failed on {node.ip}:{node.port}, retrying...")
+                                await asyncio.sleep(retry_delay)
+                                continue
+                            else:
+                                log.warning(f"Failed to store on remote node {node.ip}:{node.port} after {max_retries} attempts")
+                                return False
+                    else:
+                        if attempt < max_retries - 1:
+                            log.debug(f"No response from {node.ip}:{node.port}, retrying...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            log.warning(f"No response from {node.ip}:{node.port} after {max_retries} attempts")
+                            return False
+                            
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        log.debug(f"Error storing on {node.ip}:{node.port} (attempt {attempt + 1}): {e}, retrying...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        log.error(f"Error storing on {node.ip}:{node.port} after {max_retries} attempts: {e}")
+                        return False
+            
+            return False
+            
+        except Exception as e:
+            log.error(f"Unexpected error storing on node {node.ip}:{node.port}: {e}")
+            return False
+    
+    async def _store_local_rendezvous(self, key_hash: bytes, value: Dict) -> bool:
+        """Store rendezvous key data locally."""
+        try:
+            if not hasattr(self, '_rendezvous_storage'):
+                self._rendezvous_storage = {}
+            
+            self._rendezvous_storage[key_hash] = value
+            log.info(f"[OK] Stored rendezvous key '{value['rendezvous_key']}' locally (key_hash: {key_hash.hex()[:16]}...)")
+            log.debug(f"  Node ID: {value['node_id'][:16]}...")
+            log.debug(f"  Expires at epoch: {value['epoch']}")
+            log.debug(f"  Total local storage entries: {len(self._rendezvous_storage)}")
+            return True
+        except Exception as e:
+            log.error(f"Error storing locally: {e}")
+            return False
+
+    async def lookup_rendezvous_key(self, rendezvous_key: str) -> Optional[Dict]:
+        """
+        Look up a node ID by its rendezvous key.
+        Uses iterative search to find nodes with Node_ID closest to the key hash.
+        
+        Args:
+            rendezvous_key: The rendezvous key to look up
+        
+        Returns:
+            Dict with node_id and metadata, or None if not found
+        """
+        try:
+            # Hash the rendezvous key to find storage location
+            key_hash = digest(rendezvous_key)
+            
+            log.info(f"Looking up rendezvous key {rendezvous_key} (hash: {key_hash.hex()[:16]}...)")
+            
+            # Find nodes with Node_ID closest to the key hash
+            closest_nodes = await self._find_closest_nodes_to_key(key_hash, k=Config.REPLICATION_FACTOR)
+            
+            if not closest_nodes:
+                log.warning(f"No nodes found close to rendezvous key hash")
+                return None
+            
+            log.debug(f"Looking up on {len(closest_nodes)} closest nodes")
+            
+            # Query nodes in parallel
+            lookup_tasks = []
+            for node in closest_nodes:
+                lookup_tasks.append(self._lookup_rendezvous_on_node(node, key_hash))
+            
+            results = await asyncio.gather(*lookup_tasks, return_exceptions=True)
+            
+            # Return first valid result
+            current_epoch = self.epoch_manager.get_current_epoch()
+            
+            for result in results:
+                if isinstance(result, dict) and result:
+                    # Check if expired
+                    if result.get('expires_at', 0) < time.time():
+                        log.debug(f"Found expired rendezvous key entry")
+                        continue
+                    
+                    # Check if from wrong epoch
+                    if result.get('epoch') != current_epoch:
+                        log.debug(f"Found rendezvous key from old epoch")
+                        continue
+                    
+                    log.info(f"Found rendezvous key mapping: {rendezvous_key} -> {result['node_id'][:16]}...")
+                    return result
+            
+            log.info(f"Rendezvous key {rendezvous_key} not found on any closest nodes")
+            return None
+            
+        except Exception as e:
+            log.error(f"Error looking up rendezvous key: {e}")
+            return None
+
+    async def _lookup_rendezvous_on_node(self, node: Node, key_hash: bytes) -> Optional[Dict]:
+        """Look up rendezvous key data on a specific node with retry logic."""
+        max_retries = 2
+        retry_delay = 0.3
+        
+        try:
+            # Check if this is us - compare by Node ID
+            if node.id == self.protocol.source_node.id:
+                log.debug(f"Looking up locally (we are the target node)")
+                return await self._lookup_local_rendezvous(key_hash)
+            
+            # Use RWP for remote nodes with retries
+            if not node.rwp_port:
+                log.debug(f"Node {node.ip}:{node.port} has no RWP port")
+                return None
+            
+            for attempt in range(max_retries):
+                try:
+                    node_info = self.rwp_handler.get_node_info(node.ip, node.rwp_port)
+                    if not node_info:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            log.debug(f"Could not get node info for {node.ip}:{node.rwp_port}")
+                            return None
+                    
+                    response = self.rwp_handler.send_encrypted_message(
+                        node_info,
+                        MessageType.DHT_GET,
+                        {'key': key_hash.hex()}
+                    )
+                    
+                    if response and isinstance(response, dict):
+                        payload = response.get('payload', {})
+                        if payload.get('found'):
+                            value_str = payload.get('value')
+                            if value_str:
+                                log.debug(f"[OK] Found value on remote node {node.ip}:{node.port}")
+                                return json.loads(value_str)
+                        
+                        # If not found, don't retry
+                        log.debug(f"Value not found on remote node {node.ip}:{node.port}")
+                        return None
+                    else:
+                        if attempt < max_retries - 1:
+                            log.debug(f"No valid response from {node.ip}:{node.port}, retrying...")
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            log.debug(f"No valid response from {node.ip}:{node.port} after {max_retries} attempts")
+                            return None
+                            
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        log.debug(f"Error looking up on {node.ip}:{node.port} (attempt {attempt + 1}): {e}, retrying...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        log.debug(f"Error looking up on {node.ip}:{node.port} after {max_retries} attempts: {e}")
+                        return None
+            
+            return None
+            
+        except Exception as e:
+            log.debug(f"Unexpected error looking up on node {node.ip}:{node.port}: {e}")
+            return None
+
+    async def _lookup_local_rendezvous(self, key_hash: bytes) -> Optional[Dict]:
+        """Look up rendezvous key data locally."""
+        try:
+            if not hasattr(self, '_rendezvous_storage'):
+                self._rendezvous_storage = {}
+                log.debug(f"Local storage not initialized")
+                return None
+            
+            value = self._rendezvous_storage.get(key_hash)
+            if value:
+                log.info(f"[OK] Found rendezvous key '{value['rendezvous_key']}' in local storage")
+                log.debug(f"  Node ID: {value['node_id'][:16]}...")
+                log.debug(f"  Stored at epoch: {value['epoch']}")
+            else:
+                log.debug(f"Key hash {key_hash.hex()[:16]}... not found in local storage")
+                log.debug(f"  Available keys: {[k.hex()[:16] + '...' for k in self._rendezvous_storage.keys()]}")
+            
+            return value
+        except Exception as e:
+            log.error(f"Error looking up locally: {e}")
+            return None
+
+    async def republish_rendezvous_key(self):
+        """
+        Republish our rendezvous key to ensure it's stored on correct nodes.
+        Should be called periodically and after routing table changes.
+        """
+        try:
+            if not self.running or not self.protocol:
+                return
+            
+            rendezvous_key = self.get_rendezvous_key()
+            if not rendezvous_key:
+                log.warning("No rendezvous key to republish")
+                return
+            
+            log.debug(f"Republishing rendezvous key: {rendezvous_key}")
+            success = await self.store_rendezvous_key(rendezvous_key, self.node.id)
+            
+            if success:
+                log.info(f"Successfully republished rendezvous key")
+            else:
+                log.warning(f"Failed to republish rendezvous key")
+                
+        except Exception as e:
+            log.error(f"Error republishing rendezvous key: {e}")
+
+    def _cleanup_expired_rendezvous(self):
+        """Clean up expired rendezvous key entries from local storage."""
+        try:
+            if not hasattr(self, '_rendezvous_storage'):
+                return
+            
+            current_time = time.time()
+            current_epoch = self.epoch_manager.get_current_epoch()
+            
+            expired_keys = []
+            for key_hash, value in self._rendezvous_storage.items():
+                # Remove if expired or from old epoch
+                if (value.get('expires_at', 0) < current_time or 
+                    value.get('epoch') != current_epoch):
+                    expired_keys.append(key_hash)
+            
+            for key_hash in expired_keys:
+                del self._rendezvous_storage[key_hash]
+            
+            if expired_keys:
+                log.info(f"Cleaned up {len(expired_keys)} expired rendezvous keys")
+                
+        except Exception as e:
+            log.error(f"Error cleaning up rendezvous keys: {e}")
+
+    async def search_by_rendezvous_key(self, rendezvous_key: str) -> SearchResult:
+        """
+        Search for a node by its rendezvous key.
+        
+        Args:
+            rendezvous_key: The rendezvous key to search for
+        
+        Returns:
+            SearchResult with node information if found
+        """
+        start_time = time.time()
+        
+        try:
+            # First, look up the node ID from the rendezvous key
+            log.info(f"Looking up node ID for rendezvous key: {rendezvous_key}")
+            mapping = await self.lookup_rendezvous_key(rendezvous_key)
+            
+            if not mapping:
+                log.warning(f"Rendezvous key {rendezvous_key} not found in DHT")
+                return SearchResult(
+                    found=False,
+                    target_node=None,
+                    hops=0,
+                    path=[],
+                    search_time=time.time() - start_time,
+                    nodes_queried=0
+                )
+            
+            # Extract node ID
+            target_node_id = bytes.fromhex(mapping['node_id'])
+            log.info(f"Found mapping: {rendezvous_key} -> {target_node_id.hex()[:16]}...")
+            
+            # Now search for the actual node
+            log.info(f"Searching for node by ID: {target_node_id.hex()}")
+            search_result = await self.search_node(target_node_id.hex())
+            
+            # Add rendezvous lookup time to total
+            search_result.search_time = time.time() - start_time
+            
+            return search_result
+            
+        except Exception as e:
+            log.error(f"Error searching by rendezvous key: {e}")
+            return SearchResult(
+                found=False,
+                target_node=None,
+                hops=0,
+                path=[],
+                search_time=time.time() - start_time,
+                nodes_queried=0
+            )
+
+    def _schedule_rendezvous_republish(self):
+        """Schedule periodic rendezvous key republishing."""
+        if not self.running:
+            return
+        
+        asyncio.ensure_future(self.republish_rendezvous_key())
+        asyncio.ensure_future(self._cleanup_expired_rendezvous_task())
+        
+        loop = asyncio.get_event_loop()
+        # Republish every 2 minutes
+        loop.call_later(120, self._schedule_rendezvous_republish)
+
+    async def _cleanup_expired_rendezvous_task(self):
+        """Async wrapper for cleanup."""
+        self._cleanup_expired_rendezvous()
+
     async def _attempt_rejoin(self):
         """
         Attempt to rejoin the network when orphaned with identity regeneration fallback.
@@ -3091,7 +3245,6 @@ class RRKDHT:
                 peer_id,
                 self.messaging,
                 self.epoch_manager,
-                self.storage,
                 self.protocol.router if self.protocol else None
             )
             self.rwp_handler.start_rwp_server(self.rwp_port)
@@ -3175,197 +3328,6 @@ class RRKDHT:
                 search_time=0,
                 nodes_queried=0
             )
-
-    async def announce_rendezvous_key(self):
-        """
-        Announce this node's rendezvous key to the DHT.
-        Stores mapping: rendezvous_key -> (node_id, ip, port, rwp_port, epoch, timestamp)
-        """
-        try:
-            rendezvous_key = self.rwp_handler.rendezvous_key
-            current_epoch = self.epoch_manager.get_current_epoch()
-            
-            # Create announcement data
-            announcement = {
-                'node_id': self.node.id.hex(),
-                'ip': self.node.ip,
-                'port': self.node.port,
-                'rwp_port': self.rwp_port,
-                'epoch': current_epoch,
-                'timestamp': time.time(),
-                'rendezvous_key': rendezvous_key
-            }
-            
-            # FIXED: Store using rendezvous key directly (not digest)
-            # The key itself becomes the DHT key
-            announcement_json = json.dumps(announcement)
-            success = await self.set(rendezvous_key, announcement_json)
-            
-            if success:
-                log.info(f"Announced rendezvous key: {rendezvous_key} -> {announcement}")
-            else:
-                log.warning(f"Failed to announce rendezvous key: {rendezvous_key}")
-            
-            return success
-            
-        except Exception as e:
-            log.error(f"Error announcing rendezvous key: {e}")
-            return False
-
-    async def lookup_by_rendezvous_key(self, rendezvous_key: str) -> Optional[Dict]:
-        """
-        Look up a node by its rendezvous key.
-        
-        Args:
-            rendezvous_key: 16-character hex rendezvous key (NOT the full URL)
-            
-        Returns:
-            Node information dict if found, None otherwise
-        """
-        try:
-            # FIXED: Use rendezvous_key directly as the DHT key
-            log.info(f"Looking up rendezvous key: {rendezvous_key}")
-            result = await self.get(rendezvous_key)  # Changed from digest(rendezvous_key)
-            
-            if result:
-                # Parse stored announcement
-                try:
-                    announcement = json.loads(result) if isinstance(result, str) else result
-                    
-                    # Verify epoch is recent (within overlap window)
-                    current_epoch = self.epoch_manager.get_current_epoch()
-                    announcement_epoch = announcement.get('epoch', 0)
-                    
-                    # Accept if current epoch or previous epoch
-                    if announcement_epoch >= current_epoch - 1:
-                        log.info(f"Found node via rendezvous key: {rendezvous_key}")
-                        return announcement
-                    else:
-                        log.warning(f"Found stale announcement for {rendezvous_key} (epoch {announcement_epoch} vs {current_epoch})")
-                        return None
-                        
-                except (json.JSONDecodeError, KeyError) as e:
-                    log.error(f"Failed to parse announcement: {e}")
-                    return None
-            
-            log.debug(f"No node found for rendezvous key: {rendezvous_key}")
-            return None
-            
-        except Exception as e:
-            log.error(f"Error looking up rendezvous key {rendezvous_key}: {e}")
-            return None
-
-    async def resolve_rwp_url(self, rwp_url: str) -> Optional[Dict]:
-        """
-        Resolve an RWP URL to find the target node.
-        Format: rwp://rendezvous_key/content
-        
-        Args:
-            rwp_url: RWP URL string
-            
-        Returns:
-            Dict with 'node_info' and 'content' if successful, None otherwise
-        """
-        try:
-            # Parse URL
-            if not rwp_url.startswith("rwp://"):
-                log.error(f"Invalid RWP URL format: {rwp_url}")
-                return None
-            
-            url_part = rwp_url[6:]  # Remove 'rwp://'
-            
-            # Extract rendezvous key and content
-            if '/' in url_part:
-                rendezvous_key, content = url_part.split('/', 1)
-            else:
-                rendezvous_key = url_part
-                content = ""
-            
-            log.info(f"Resolving RWP URL: rdv_key={rendezvous_key}, content={content}")
-            
-            # Look up node by rendezvous key
-            node_info = await self.lookup_by_rendezvous_key(rendezvous_key)
-            
-            if node_info:
-                log.info(f"Successfully resolved {rwp_url} to node {node_info['node_id']}")
-                return {
-                    'node_info': node_info,
-                    'content': content,
-                    'rendezvous_key': rendezvous_key
-                }
-            
-            log.warning(f"Failed to resolve {rwp_url}")
-            return None
-            
-        except Exception as e:
-            log.error(f"Error resolving RWP URL {rwp_url}: {e}")
-            return None
-
-    def _schedule_rendezvous_announcement(self):
-        """Schedule periodic rendezvous key announcements."""
-        if not self.running:
-            return
-        
-        asyncio.ensure_future(self.announce_rendezvous_key())
-        
-        # Re-announce every epoch (minus some buffer for propagation)
-        announcement_interval = self.epoch_manager.epoch_duration - 30
-        
-        loop = asyncio.get_event_loop()
-        self.rdv_announcement_loop = loop.call_later(
-            announcement_interval,
-            self._schedule_rendezvous_announcement
-        )
-
-    async def search_by_rendezvous(self, rendezvous_key: str) -> Dict:
-        """
-        Search for a node using its rendezvous key with fallback strategies.
-        
-        Args:
-            rendezvous_key: The rendezvous key to search for
-            
-        Returns:
-            Dict with search results and node info
-        """
-        search_start = time.time()
-        
-        # Strategy 1: Direct DHT lookup
-        node_info = await self.lookup_by_rendezvous_key(rendezvous_key)
-        if node_info:
-            return {
-                'found': True,
-                'method': 'dht_lookup',
-                'node_info': node_info,
-                'search_time': time.time() - search_start
-            }
-        
-        # Strategy 2: Check local routing table
-        local_nodes = self.find_node_by_rendezvous_key(rendezvous_key)
-        if local_nodes:
-            return {
-                'found': True,
-                'method': 'local_routing_table',
-                'node_info': {
-                    'node_id': local_nodes[0].id.hex(),
-                    'ip': local_nodes[0].ip,
-                    'port': local_nodes[0].port,
-                    'rwp_port': local_nodes[0].rwp_port,
-                    'rendezvous_key': rendezvous_key
-                },
-                'search_time': time.time() - search_start
-            }
-        
-        # Strategy 3: Try previous epoch key
-        # (In case announcement from previous epoch hasn't expired)
-        previous_epoch = self.epoch_manager.get_current_epoch() - 1
-        # Note: Would need node_id to recalculate, so this is limited
-        
-        return {
-            'found': False,
-            'method': 'exhausted',
-            'node_info': None,
-            'search_time': time.time() - search_start
-        }
 
     def _schedule_sync_heartbeat(self):
         """Schedule the next synchronized heartbeat."""
@@ -3579,7 +3541,7 @@ class RRKDHT:
         self.refresh_loop = loop.call_later(interval, self.refresh_table)
 
     async def _refresh_table(self):
-        """Refresh buckets that haven't had any lookups in the last hour."""
+        """Refresh buckets"""
         if not self.running:
             return
             
@@ -3594,25 +3556,6 @@ class RRKDHT:
 
         # Do our crawling
         await asyncio.gather(*results)
-
-        # Republish keys older than one hour with current epoch
-        for dkey, value in self.storage.iter_older_than(3600):
-            await self.set_digest(dkey, value)
-
-    def bootstrappable_neighbors(self):
-        """Get a list of (ip, port, rwp_port) tuples suitable for bootstrapping."""
-        neighbors = self.protocol.router.find_neighbors(self.node)
-        seen_addresses = set()
-        unique_neighbors = []
-        
-        for n in neighbors:
-            if n.ip and n.port:
-                address_key = (n.ip, n.port)
-                if address_key not in seen_addresses:
-                    seen_addresses.add(address_key)
-                    unique_neighbors.append((n.ip, n.port, n.rwp_port))
-        
-        return unique_neighbors
 
     async def bootstrap(self, addrs):
         """
@@ -3664,86 +3607,22 @@ class RRKDHT:
         log.debug(f"Bootstrap ping result: {result}")
         return Node(result[1], ip, port, rwp_port) if result[0] else None
 
-    async def get(self, key):
-        """
-        Get a key if the network has it.
-
-        Returns:
-            None if not found, the value otherwise.
-        """
-        log.info("Looking up key %s", key)
-        dkey = digest(key)
+    def bootstrappable_neighbors(self):
+        """Get a list of (ip, port, rwp_port) tuples suitable for bootstrapping."""
+        neighbors = self.protocol.router.find_neighbors(self.node)
+        seen_addresses = set()
+        unique_neighbors = []
         
-        # Check local storage first across all retrieval epochs
-        retrieval_epochs = self.epoch_manager.get_retrieval_epochs()
-        for epoch in retrieval_epochs:
-            epoch_key = self.protocol._get_epoch_key(dkey, epoch)
-            local_value = self.storage.get(epoch_key)
-            if local_value is not None:
-                log.debug(f"Found key locally in epoch {epoch}")
-                return local_value
+        for n in neighbors:
+            if n.ip and n.port:
+                address_key = (n.ip, n.port)
+                if address_key not in seen_addresses:
+                    seen_addresses.add(address_key)
+                    unique_neighbors.append((n.ip, n.port, n.rwp_port))
         
-        node = Node(dkey)
-        nearest = self.protocol.router.find_neighbors(node)
-        if not nearest:
-            log.warning("There are no known neighbors to get key %s", key)
-            return None
-            
-        spider = ValueSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
-        return await spider.find()
-
-    async def set(self, key, value):
-        """Set the given string key to the given value in the network."""
-        if not check_dht_value_type(value):
-            raise TypeError("Value must be of type int, float, bool, str, or bytes")
-        log.info("Setting '%s' = '%s' on network", key, value)
-        dkey = digest(key)
-        return await self.set_digest(dkey, value)
-
-    async def set_digest(self, dkey, value):
-        """Set the given SHA1 digest key (bytes) to the given value in the network."""
-        node = Node(dkey)
-
-        nearest = self.protocol.router.find_neighbors(node)
-        if not nearest:
-            log.warning("There are no known neighbors to set key %s", dkey.hex())
-            return False
-
-        # FIXED: Disable learning during spider crawl to prevent cascading discoveries
-        old_learning = self.protocol.learning_enabled
-        self.protocol.learning_enabled = False
-        
-        try:
-            spider = NodeSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
-            nodes = await spider.find()
-            log.info("Setting '%s' on %s", dkey.hex(), list(map(str, nodes)))
-
-            # Store locally if this node is close enough
-            biggest = max([n.distance_to(node) for n in nodes])
-            if self.node.distance_to(node) < biggest:
-                # Store with current epoch
-                current_epochs = self.epoch_manager.get_storage_epochs()
-                for epoch in current_epochs:
-                    epoch_key = self.protocol._get_epoch_key(dkey, epoch)
-                    self.storage[epoch_key] = value
-
-            # FIXED: Limit concurrent store operations
-            results = []
-            for i in range(0, len(nodes), 3):  # Process in batches of 3
-                batch = nodes[i:i+3]
-                batch_results = await asyncio.gather(
-                    *[self.protocol.call_store(n, dkey, value) for n in batch]
-                )
-                results.extend(batch_results)
-                
-            return any(results)
-            
-        finally:
-            # Restore learning setting
-            self.protocol.learning_enabled = old_learning
+        return unique_neighbors
 
     def save_state(self, fname):
-        """Save the state of this node to a cache file."""
         log.info("Saving state to %s", fname)
         
         # Get signing keys in serializable format
@@ -3826,7 +3705,7 @@ class RRKDHT:
         )
 
     def get_debug_info(self):
-        """Get comprehensive debug information about the node with enhanced routing details."""
+        """Get comprehensive debug information"""
         basic_info = {
             "node_info": {
                 "node_id": self.node.id.hex(),
@@ -3861,7 +3740,6 @@ class RRKDHT:
                 "last_check": self.last_responsible_check,
                 "seconds_since_check": int(time.time() - self.last_responsible_check) if self.last_responsible_check else None
             },
-            "storage_info": self.storage.get_debug_info(),
             "rwp_info": {
                 "node_info_cache_size": len(self.rwp_handler.node_info_cache) if self.rwp_handler else 0,
                 "cached_nodes": list(self.rwp_handler.node_info_cache.keys()) if self.rwp_handler else []
@@ -3920,7 +3798,7 @@ class RRKDHT:
             basic_info["total_neighbors"] = len(all_neighbors)
             
             # Add closest neighbors summary
-            basic_info["closest_neighbors"] = all_neighbors[:10]  # Show 10 closest
+            basic_info["closest_neighbors"] = all_neighbors[:10]
             
         else:
             basic_info["routing_info"] = {
@@ -3992,9 +3870,9 @@ class RWPDHTHandler(RWPProtocolHandler):
     """Enhanced RWP handler with DHT operation support."""
     
     def __init__(self, node_id: str, messaging: SecureMessaging, 
-                 epoch_manager: EpochManager, storage: IStorage, router):
+                epoch_manager: EpochManager, router):
+        """Enhanced RWP handler."""
         super().__init__(node_id, messaging, epoch_manager)
-        self.storage = storage
         self.router = router
     
     def _handle_rendezvous_request(self, client_socket: socket.socket, 
@@ -4043,7 +3921,7 @@ class RWPDHTHandler(RWPProtocolHandler):
             self._send_rwp_error(client_socket, 500, "Internal Server Error")
     
     def _handle_dht_message(self, message_type: MessageType, message: Dict) -> Dict:
-        """Handle DHT-specific messages with corrected response format."""
+        """Handle DHT messages - ONLY ROUTING OPERATIONS."""
         payload = message['payload']
         
         if message_type == MessageType.PING or message_type == MessageType.HEARTBEAT:
@@ -4083,72 +3961,83 @@ class RWPDHTHandler(RWPProtocolHandler):
                 'message_id': os.urandom(16).hex()
             }
             
-        elif message_type == MessageType.FIND_VALUE:
-            key_bytes = bytes.fromhex(payload['key'])
-            
-            # Try to find value in storage
-            retrieval_epochs = self.epoch_manager.get_retrieval_epochs()
-            for epoch in retrieval_epochs:
-                epoch_key = self._get_epoch_key(key_bytes, epoch)
-                value = self.storage.get(epoch_key)
-                if value is not None:
-                    return {
-                        'type': 'find_value_response',
-                        'sender_id': self.node_id,
-                        'payload': {
-                            'success': True,
-                            'found': True,
-                            'value': value
-                        },
-                        'timestamp': time.time(),
-                        'message_id': os.urandom(16).hex()
-                    }
-            
-            # If not found, return closest nodes
-            node = Node(key_bytes)
-            neighbors = self.router.find_neighbors(node)
-            
-            return {
-                'type': 'find_value_response',
-                'sender_id': self.node_id,
-                'payload': {
-                    'success': True,
-                    'found': False,
-                    'nodes': [
-                        {
-                            'id': n.id.hex(),
-                            'ip': n.ip,
-                            'port': n.port,
-                            'rwp_port': n.rwp_port,
-                            'rendezvous_key': n.rendezvous_key
-                        }
-                        for n in neighbors
-                    ]
-                },
-                'timestamp': time.time(),
-                'message_id': os.urandom(16).hex()
-            }
-            
-        elif message_type == MessageType.STORE:
-            key_bytes = bytes.fromhex(payload['key'])
-            value = payload['value']
-            
-            # Store with current epoch
-            storage_epochs = self.epoch_manager.get_storage_epochs()
-            for epoch in storage_epochs:
-                epoch_key = self._get_epoch_key(key_bytes, epoch)
-                self.storage[epoch_key] = value
-            
-            return {
-                'type': 'store_response',
-                'sender_id': self.node_id,
-                'payload': {
-                    'success': True
-                },
-                'timestamp': time.time(),
-                'message_id': os.urandom(16).hex()
-            }
-            
+        elif message_type == MessageType.DHT_GET:
+            # Handle GET request
+            try:
+                key_hash = bytes.fromhex(payload['key'])
+                
+                # Check local storage
+                value = None
+                if hasattr(self.router.protocol, 'server_ref'):
+                    server = self.router.protocol.server_ref
+                    if hasattr(server, '_rendezvous_storage'):
+                        value = server._rendezvous_storage.get(key_hash)
+                
+                return {
+                    'type': 'dht_get_response',
+                    'sender_id': self.node_id,
+                    'payload': {
+                        'success': True,
+                        'found': value is not None,
+                        'value': json.dumps(value) if value else None
+                    },
+                    'timestamp': time.time(),
+                    'message_id': os.urandom(16).hex()
+                }
+                
+            except Exception as e:
+                log.error(f"Error handling DHT_GET: {e}")
+                return {
+                    'type': 'error',
+                    'sender_id': self.node_id,
+                    'payload': {
+                        'success': False,
+                        'message': str(e)
+                    },
+                    'timestamp': time.time(),
+                    'message_id': os.urandom(16).hex()
+                }
+        
+        elif message_type == MessageType.DHT_SET:
+            # Handle SET request
+            try:
+                key_hash = bytes.fromhex(payload['key'])
+                value = json.loads(payload['value'])
+                
+                # Store locally
+                success = False
+                if hasattr(self.router.protocol, 'server_ref'):
+                    server = self.router.protocol.server_ref
+                    if not hasattr(server, '_rendezvous_storage'):
+                        server._rendezvous_storage = {}
+                    
+                    server._rendezvous_storage[key_hash] = value
+                    success = True
+                    log.info(f"Stored rendezvous key {value.get('rendezvous_key')} locally")
+                
+                return {
+                    'type': 'dht_set_response',
+                    'sender_id': self.node_id,
+                    'payload': {
+                        'success': success
+                    },
+                    'timestamp': time.time(),
+                    'message_id': os.urandom(16).hex()
+                }
+                
+            except Exception as e:
+                log.error(f"Error handling DHT_SET: {e}")
+                return {
+                    'type': 'error',
+                    'sender_id': self.node_id,
+                    'payload': {
+                        'success': False,
+                        'message': str(e)
+                    },
+                    'timestamp': time.time(),
+                    'message_id': os.urandom(16).hex()
+                }
+
         else:
             return {
                 'type': 'error',
@@ -4162,6 +4051,6 @@ class RWPDHTHandler(RWPProtocolHandler):
             }
     
     def _get_epoch_key(self, key, epoch):
-        """Generate epoch-specific storage key."""
+        """Generate epoch-specific key."""
         epoch_data = f"{key.hex()}:epoch:{epoch}"
         return digest(epoch_data)
