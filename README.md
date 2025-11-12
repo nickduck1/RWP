@@ -23,6 +23,7 @@ What’s Left:
 - Integrate the real server (not tserver.py), with the core (RRKDHT.py).
 
 Interrupted integration, Because Ive made a big mistake. (Easy fix, But working on it. May take time!)
+Broblem fixed, But the new implementation still has some bugs. So I'm still proof-testing it!!
 
 Note:
 It may take a while to be ready for real use (production), Because i have studies and AI is not that good in helping.
