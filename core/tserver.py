@@ -30,7 +30,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.backends import default_backend
 
 # Import the RRKDHT implementation
-from RRKDHT import RRKDHT, ForgetfulStorage, create_ed25519_key_pair, generate_peer_id, digest
+from RRKDHT import RRKDHT, create_ed25519_key_pair, generate_peer_id, digest
 
 # Configure logging
 logging.basicConfig(
@@ -425,10 +425,6 @@ class WebRWPServer:
                 'node_info': debug_info['node_info'],
                 'epoch_info': debug_info['epoch_info'],
                 'routing_info': debug_info['routing_info'],
-                'storage_info': {
-                    'total_items': debug_info['storage_info']['total_items'],
-                    'ttl_seconds': debug_info['storage_info']['ttl_seconds']
-                },
                 'server_info': {
                     'server_id': self.server_id,
                     'protocol_version': self.protocol_version,
@@ -599,7 +595,6 @@ class RRKDHTServerManager:
             self.dht_node = RRKDHT(
                 ksize=3,
                 alpha=3,
-                storage=ForgetfulStorage(ttl=86400),  # 24 hour TTL
                 signing_keys=(signing_private_key, signing_public_key),
                 rwp_port=8443
             )
@@ -668,6 +663,7 @@ class RRKDHTServerManager:
             print(f"  debug               - Show comprehensive debug info")
             print(f"  ping <ip> <port>    - Ping a specific node")
             print(f"  search <node_id>    - Search for a node by Node ID")
+            print(f"  search-rk <key>     - Search for a node by Rendezvous Key")
             print(f"  help                - Show this help message")
             print(f"  quit, exit          - Shutdown server")
             print(f"Enter commands below:")
@@ -695,6 +691,17 @@ class RRKDHTServerManager:
                     elif command == 'rt-repl':
                         self.display_routing_table(show_replacement_nodes=True)
                     
+                    elif command.startswith('search-rk '):
+                        parts = command.split(maxsplit=1)
+                        if len(parts) >= 2:
+                            rendezvous_key = parts[1].strip()
+                            asyncio.run_coroutine_threadsafe(
+                                self.search_by_rendezvous_command(rendezvous_key),
+                                self.loop
+                            )
+                        else:
+                            print("Usage: search-rk <rendezvous_key>")
+
                     elif command == 'neighbors':
                         self.display_neighbors()
                     
@@ -707,33 +714,6 @@ class RRKDHTServerManager:
                     elif command == 'debug':
                         self.display_comprehensive_debug()
                     
-                    elif command.startswith('resolve '):
-                        parts = command.split(maxsplit=1)
-                        if len(parts) >= 2:
-                            rwp_url = parts[1].strip()
-                            asyncio.run_coroutine_threadsafe(
-                                self.resolve_rwp_command(rwp_url),
-                                self.loop
-                            )
-                        else:
-                            print("Usage: resolve <rwp_url>")
-
-                    elif command.startswith('lookup-rdv '):
-                        parts = command.split()
-                        if len(parts) >= 2:
-                            rdv_key = parts[1].strip()
-                            asyncio.run_coroutine_threadsafe(
-                                self.lookup_rdv_command(rdv_key),
-                                self.loop
-                            )
-                        else:
-                            print("Usage: lookup-rdv <rendezvous_key>")
-
-                    elif command == 'announce':
-                        asyncio.run_coroutine_threadsafe(
-                            self.announce_rdv_command(),
-                            self.loop
-                        )                    
                     elif command.startswith('ping '):
                         parts = command.split()
                         if len(parts) >= 3:
@@ -766,6 +746,7 @@ class RRKDHTServerManager:
                         print(f"  rt, routing         - Show routing table")
                         print(f"  rt-full             - Show routing table with empty buckets")
                         print(f"  rt-repl             - Show routing table with replacement nodes")
+                        print(f"  search-rk <key>     - Search for node by Rendezvous Key")
                         print(f"  neighbors           - Show all neighbors by distance") 
                         print(f"  health              - Show routing health analysis")
                         print(f"  status              - Show current node status")
@@ -841,116 +822,6 @@ class RRKDHTServerManager:
             import traceback
             traceback.print_exc()
 
-    async def resolve_rwp_command(self, rwp_url: str):
-        """Resolve an RWP URL and display results."""
-        print(f"\nResolving RWP URL: {rwp_url}")
-        print("=" * 60)
-        
-        try:
-            result = await self.dht_node.resolve_rwp_url(rwp_url)
-            
-            if result:
-                print("✓ RESOLVED")
-                print(f"\nNode Information:")
-                node_info = result['node_info']
-                print(f"  Node ID: {node_info['node_id']}")
-                print(f"  Address: {node_info['ip']}:{node_info['port']}")
-                print(f"  RWP Port: {node_info['rwp_port']}")
-                print(f"  Epoch: {node_info['epoch']}")
-                print(f"  Rendezvous Key: {result['rendezvous_key']}")
-                
-                if result['content']:
-                    print(f"\nContent Path: {result['content']}")
-                else:
-                    print(f"\nContent Path: (empty)")
-            else:
-                print("✗ NOT FOUND")
-                print("The rendezvous key may be:")
-                print("  • Expired (old epoch)")
-                print("  • Not announced to the DHT")
-                print("  • From a node that is offline")
-            
-            print("=" * 60 + "\n")
-            
-        except Exception as e:
-            print(f"✗ Resolution error: {e}")
-
-    async def announce_rdv_command(self):
-        """Manually trigger rendezvous key announcement."""
-        print(f"\nAnnouncing rendezvous key...")
-        
-        try:
-            success = await self.dht_node.announce_rendezvous_key()
-            
-            if success:
-                print(f"✓ Successfully announced rendezvous key")
-                print(f"  Key: {self.dht_node.rwp_handler.rendezvous_key}")
-                print(f"  Epoch: {self.dht_node.epoch_manager.get_current_epoch()}")
-                print(f"  RWP URL: rwp://{self.dht_node.rwp_handler.rendezvous_key}/")
-            else:
-                print(f"✗ Failed to announce rendezvous key")
-        
-        except Exception as e:
-            print(f"✗ Announcement error: {e}")
-
-    async def lookup_rdv_command(self, rdv_key: str):
-        """Look up a node by rendezvous key."""
-        # FIXED: Handle both formats (with or without rwp:// prefix)
-        if rdv_key.startswith("rwp://"):
-            # Extract just the rendezvous key
-            url_part = rdv_key[6:]
-            if '/' in url_part:
-                rdv_key, _ = url_part.split('/', 1)
-            else:
-                rdv_key = url_part
-        
-        print(f"\nLooking up rendezvous key: {rdv_key}")
-        print("=" * 60)
-        
-        try:
-            result = await self.dht_node.search_by_rendezvous(rdv_key)
-            
-            if result['found']:
-                print(f"✓ FOUND via {result['method']}")
-                print(f"Search time: {result['search_time']:.3f}s")
-                
-                node_info = result['node_info']
-                print(f"\nNode Information:")
-                print(f"  Node ID: {node_info['node_id']}")
-                print(f"  Address: {node_info['ip']}:{node_info['port']}")
-                print(f"  RWP Port: {node_info.get('rwp_port', 'N/A')}")
-                
-                if 'epoch' in node_info:
-                    print(f"  Epoch: {node_info['epoch']}")
-                if 'timestamp' in node_info:
-                    age = time.time() - node_info['timestamp']
-                    print(f"  Announcement age: {age:.1f}s")
-                
-                # Show the working RWP URL
-                print(f"\nRWP URL: rwp://{rdv_key}/")
-            else:
-                print(f"✗ NOT FOUND")
-                print(f"Search time: {result['search_time']:.3f}s")
-                print(f"Method: {result['method']}")
-                
-                # Helpful debug info
-                current_epoch = self.dht_node.epoch_manager.get_current_epoch()
-                print(f"\nDebug Info:")
-                print(f"  Current Epoch: {current_epoch}")
-                print(f"  Your Rendezvous Key: {self.dht_node.rwp_handler.rendezvous_key}")
-                print(f"\nPossible reasons:")
-                print(f"  • Node hasn't announced this key yet")
-                print(f"  • Key is from wrong epoch")
-                print(f"  • Node is offline or unreachable")
-                print(f"  • Not enough nodes to propagate the announcement")
-            
-            print("=" * 60 + "\n")
-            
-        except Exception as e:
-            print(f"✗ Lookup error: {e}")
-            import traceback
-            traceback.print_exc()
-
     def display_routing_table(self, show_empty_buckets=False, show_replacement_nodes=False):
         """Display detailed routing table information."""
         if not self.dht_node or not self.dht_node.protocol:
@@ -962,6 +833,51 @@ class RRKDHTServerManager:
             show_empty_buckets=show_empty_buckets, 
             show_replacement_nodes=show_replacement_nodes
         )
+
+    async def search_by_rendezvous_command(self, rendezvous_key: str):
+        """Execute rendezvous key search and display results."""
+        print(f"\nSearching for node by rendezvous key: {rendezvous_key}")
+        print(f"{'='*60}")
+        
+        try:
+            result = await self.dht_node.search_by_rendezvous_key(rendezvous_key)
+            
+            if result.found:
+                print(f"✅ NODE FOUND!")
+                print(f"\nTarget Node Information:")
+                print(f"  Node ID: {result.target_node.id.hex()}")
+                print(f"  Address: {result.target_node.ip}:{result.target_node.port}")
+                print(f"  RWP Port: {result.target_node.rwp_port}")
+                if result.target_node.rendezvous_key:
+                    print(f"  Rendezvous Key: {result.target_node.rendezvous_key}")
+                
+                print(f"\nSearch Statistics:")
+                print(f"  Total Time: {result.search_time:.3f} seconds")
+                print(f"  Hops: {result.hops}")
+                print(f"  Nodes Queried: {result.nodes_queried}")
+                
+                if result.path:
+                    print(f"\nSearch Path:")
+                    for i, path_node_id in enumerate(result.path, 1):
+                        print(f"    {i}. {path_node_id}")
+            else:
+                print(f"❌ NODE NOT FOUND")
+                print(f"\nSearch Statistics:")
+                print(f"  Total Time: {result.search_time:.3f} seconds")
+                print(f"  Hops: {result.hops}")
+                print(f"  Nodes Queried: {result.nodes_queried}")
+                
+                print(f"\nPossible reasons:")
+                print(f"  • Rendezvous key not registered in DHT")
+                print(f"  • Node is offline or unreachable")
+                print(f"  • Rendezvous key has expired (epoch changed)")
+            
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"❌ Search error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def display_neighbors(self):
         """Display all neighbors sorted by distance."""
@@ -1069,12 +985,6 @@ class RRKDHTServerManager:
         print(f"  Stale Nodes: {routing_info.get('stale_nodes', 0)}")
         print(f"  Failed Nodes: {routing_info.get('failed_nodes', 0)}")
         
-        # Storage status
-        storage_info = debug_info['storage_info']
-        print(f"\nStorage:")
-        print(f"  Items: {storage_info['total_items']}")
-        print(f"  TTL: {storage_info['ttl_seconds']} seconds")
-        
         # Web-RWP status
         if self.web_rwp_server:
             print(f"\nWeb-RWP Server:")
@@ -1103,7 +1013,6 @@ class RRKDHTServerManager:
             'node_info': debug_info['node_info'],
             'epoch_info': debug_info['epoch_info'],
             'routing_summary': debug_info.get('routing_info', {}),
-            'storage_info': debug_info['storage_info'],
             'rwp_info': debug_info['rwp_info'],
             'neighbor_count': debug_info.get('total_neighbors', 0),
             'closest_neighbors': debug_info.get('closest_neighbors', [])[:5]  # Top 5 only
@@ -1152,9 +1061,6 @@ class RRKDHTServerManager:
         print(f"Total Buckets: {debug_info['routing_info']['total_buckets']}")
         print(f"Total Nodes: {debug_info['routing_info']['total_nodes']}")
         print(f"Lonely Buckets: {debug_info['routing_info']['lonely_buckets']}")
-        print(f"\nSTORAGE")
-        print(f"Total Items: {debug_info['storage_info']['total_items']}")
-        print(f"TTL: {debug_info['storage_info']['ttl_seconds']} seconds")
         
         # Show neighbors if any
         neighbors = self.dht_node.bootstrappable_neighbors()
