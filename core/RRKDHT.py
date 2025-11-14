@@ -448,18 +448,23 @@ class NodeSearch:
             best_distance = min(self.target_node.distance_to(n) for n in current_closest)
             log.debug(f"Starting search with best distance: {best_distance}")
 
+            # Track all known candidates, not limited
+            all_candidates = list(current_closest)
+
             # Iterative search
             for hop in range(self.max_hops):
                 if time.time() - self.start_time > self.timeout:
                     log.warning(f"Search timed out after {hop} hops")
                     break
 
-                unqueried = [n for n in current_closest if n.id not in self.queried_nodes]
+                unqueried = [n for n in all_candidates if n.id not in self.queried_nodes]
                 if not unqueried:
                     log.info(f"No more unqueried nodes after {hop} hops")
                     break
 
-                nodes_to_query = unqueried[:self.alpha]
+                # When no improvement, expand to query more at current distance
+                nodes_to_query = sorted(unqueried, key=lambda n: self.target_node.distance_to(n))[:self.alpha]
+
                 log.info(f"Hop {hop + 1}: Querying {len(nodes_to_query)} nodes "
                         f"(best distance so far: {best_distance})")
 
@@ -495,18 +500,16 @@ class NodeSearch:
                     log.info(f"No new neighbors discovered after {hop + 1} hops")
                     break
 
-                # Merge and deduplicate
-                all_candidates = current_closest + new_neighbors
-                all_candidates = [n for n in all_candidates if n.id not in self.queried_nodes]
+                # Merge new neighbors into all_candidates without limit
+                for new_node in new_neighbors:
+                    if new_node.id not in {c.id for c in all_candidates} and new_node.id != self.target_node_id:
+                        all_candidates.append(new_node)
 
-                # Remove duplicates by ID
-                unique_candidates = {node.id: node for node in all_candidates}
-                
-                # Sort by distance to target and keep closest ones
+                # Update current_closest from all_candidates
                 current_closest = sorted(
-                    unique_candidates.values(),
+                    [n for n in all_candidates if n.id not in self.queried_nodes],
                     key=lambda n: self.target_node.distance_to(n)
-                )[:self.alpha * 2]
+                )
 
                 # Check if we're making progress
                 if current_closest:
@@ -516,12 +519,7 @@ class NodeSearch:
                         best_distance = new_best
                     elif new_best == best_distance:
                         log.debug(f"No improvement in distance (stuck at {best_distance})")
-                        # If we've queried all candidates at this distance, we're done
-                        closest_unqueried = [n for n in current_closest 
-                                            if n.id not in self.queried_nodes]
-                        if not closest_unqueried:
-                            log.info("Exhausted all nodes at closest distance - search complete")
-                            break
+                        # Continue querying all at this distance; no early break unless no unqueried left
                 else:
                     break
 
