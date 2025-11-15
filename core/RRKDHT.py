@@ -384,18 +384,19 @@ class NodeHeap:
 class SearchResult:
     """Result of a node search operation."""
     found: bool
-    target_node: Optional['Node']  # Use string annotation to avoid forward reference
+    target_node: Optional['Node']
     hops: int
-    path: List[str]  # List of node IDs traversed
+    path: List[str]
     search_time: float
     nodes_queried: int
+    cycle_detected: bool = False
 
 class NodeSearch:
-    """Handles iterative node search with proper hop limiting."""
+    """Handles iterative node search with ring-topology cycle detection."""
     
     def __init__(self, protocol, target_node_id: bytes, max_hops: int = Config.SEARCH_MAX_HOPS,
                 timeout: float = Config.SEARCH_TIMEOUT, alpha: int = Config.SEARCH_PARALLELISM):
-        """Initialize NodeSearch with proper setup."""
+        """Initialize NodeSearch with cycle detection."""
         self.protocol = protocol
         self.target_node_id = target_node_id
         self.target_node = Node(target_node_id)
@@ -404,13 +405,16 @@ class NodeSearch:
         self.alpha = alpha
         
         self.queried_nodes: Set[bytes] = set()
+        self.seen_nodes: Set[bytes] = {protocol.source_node.id}  # NEW: Track ALL encountered nodes
         self.path: List[str] = []
         self.start_time = time.time()
         self.nodes_queried = 0
+        self.cycle_detected = False  # NEW: Flag for cycle detection
     
     async def search(self) -> SearchResult:
         """
-        Perform iterative search with improved convergence detection.
+        Perform iterative search with ring-topology cycle detection.
+        Stops when target found, max hops reached, or network cycle completed.
         """
         log.info(f"Starting iterative search for node {self.target_node_id.hex()}")
 
@@ -430,8 +434,12 @@ class NodeSearch:
                 return SearchResult(
                     found=False, target_node=None, hops=0,
                     path=self.path, search_time=time.time() - self.start_time,
-                    nodes_queried=0
+                    nodes_queried=0, cycle_detected=False
                 )
+
+            # Initialize seen_nodes with starting neighbors
+            for node in current_closest:
+                self.seen_nodes.add(node.id)
 
             # Check if we already know the target
             for node in current_closest:
@@ -441,32 +449,34 @@ class NodeSearch:
                     return SearchResult(
                         found=True, target_node=node, hops=0,
                         path=self.path, search_time=time.time() - self.start_time,
-                        nodes_queried=0
+                        nodes_queried=0, cycle_detected=False
                     )
 
             # Track the closest distance we've seen
             best_distance = min(self.target_node.distance_to(n) for n in current_closest)
             log.debug(f"Starting search with best distance: {best_distance}")
 
-            # Track all known candidates, not limited
+            # Track all known candidates for querying
             all_candidates = list(current_closest)
 
-            # Iterative search
+            # Iterative search with cycle detection
             for hop in range(self.max_hops):
                 if time.time() - self.start_time > self.timeout:
                     log.warning(f"Search timed out after {hop} hops")
                     break
 
+                # Get unqueried nodes from our candidate pool
                 unqueried = [n for n in all_candidates if n.id not in self.queried_nodes]
                 if not unqueried:
                     log.info(f"No more unqueried nodes after {hop} hops")
                     break
 
-                # When no improvement, expand to query more at current distance
+                # Query closest unqueried nodes
                 nodes_to_query = sorted(unqueried, key=lambda n: self.target_node.distance_to(n))[:self.alpha]
 
                 log.info(f"Hop {hop + 1}: Querying {len(nodes_to_query)} nodes "
-                        f"(best distance so far: {best_distance})")
+                        f"(best distance so far: {best_distance}, "
+                        f"seen {len(self.seen_nodes)} unique nodes)")
 
                 query_tasks = []
                 for node in nodes_to_query:
@@ -477,7 +487,8 @@ class NodeSearch:
 
                 results = await asyncio.gather(*query_tasks, return_exceptions=True)
 
-                new_neighbors = []
+                # Process results with enhanced cycle detection
+                truly_new_nodes = []  # NEW: Track genuinely new discoveries
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         log.debug(f"Query to {nodes_to_query[i].ip}:{nodes_to_query[i].port} "
@@ -490,46 +501,63 @@ class NodeSearch:
                             found=True, target_node=result['node'],
                             hops=hop + 1, path=self.path,
                             search_time=time.time() - self.start_time,
-                            nodes_queried=self.nodes_queried
+                            nodes_queried=self.nodes_queried,
+                            cycle_detected=False
                         )
 
                     if result['neighbors']:
-                        new_neighbors.extend(result['neighbors'])
+                        for neighbor in result['neighbors']:
+                            # Add to seen_nodes immediately
+                            self.seen_nodes.add(neighbor.id)
+                            
+                            # Add to candidates if not already present
+                            if neighbor.id not in {c.id for c in all_candidates}:
+                                all_candidates.append(neighbor)
+                            
+                            # Count truly new nodes for cycle detection
+                            if neighbor.id not in self.queried_nodes:
+                                truly_new_nodes.append(neighbor)
 
-                if not new_neighbors:
-                    log.info(f"No new neighbors discovered after {hop + 1} hops")
+                # UPDATED: Robust cycle detection
+                if not truly_new_nodes:
+                    self.cycle_detected = True
+                    log.info(f"Network cycle detected after {hop + 1} hops: "
+                            f"queried {len(self.queried_nodes)} nodes, "
+                            f"seen {len(self.seen_nodes)} total unique nodes, "
+                            f"no new nodes discovered")
                     break
 
-                # Merge new neighbors into all_candidates without limit
-                for new_node in new_neighbors:
-                    if new_node.id not in {c.id for c in all_candidates} and new_node.id != self.target_node_id:
-                        all_candidates.append(new_node)
-
-                # Update current_closest from all_candidates
+                # Update current closest candidates
                 current_closest = sorted(
                     [n for n in all_candidates if n.id not in self.queried_nodes],
                     key=lambda n: self.target_node.distance_to(n)
                 )
 
-                # Check if we're making progress
+                # Check distance improvement for additional early termination
                 if current_closest:
                     new_best = self.target_node.distance_to(current_closest[0])
                     if new_best < best_distance:
                         log.debug(f"Progress: distance improved from {best_distance} to {new_best}")
                         best_distance = new_best
-                    elif new_best == best_distance:
-                        log.debug(f"No improvement in distance (stuck at {best_distance})")
-                        # Continue querying all at this distance; no early break unless no unqueried left
+                    elif new_best == best_distance and len(truly_new_nodes) < self.alpha:
+                        # No distance improvement AND few new nodes = near convergence
+                        log.debug(f"Convergence: distance stalled at {best_distance} with limited new nodes")
+                        break
                 else:
+                    log.debug("No more unqueried candidates")
                     break
 
-            # Search exhausted without finding target
-            log.info(f"Search completed without finding target after {len(self.path)} queries")
+            # Search exhausted
+            log.info(f"Search completed: {'cycle detected' if self.cycle_detected else 'exhausted'}, "
+                    f"queried {self.nodes_queried} nodes, "
+                    f"traversed {len(self.seen_nodes)} unique nodes")
+            
             return SearchResult(
                 found=False, target_node=None,
                 hops=len(self.path), path=self.path,
                 search_time=time.time() - self.start_time,
-                nodes_queried=self.nodes_queried
+                nodes_queried=self.nodes_queried,
+                cycle_detected=self.cycle_detected
             )
 
         finally:
@@ -538,26 +566,21 @@ class NodeSearch:
     
     async def _query_node(self, node: 'Node') -> Dict:
         """
-        Query a single node for the target with improved response validation.
+        Query a single node for the target with improved validation.
         """
         try:
             log.debug(f"Querying {node.ip}:{node.port} for target {self.target_node_id.hex()[:16]}...")
             
-            # Use find_node RPC to ask if they know the target
             result = await self.protocol.call_find_node(node, self.target_node)
             
             if not result[0]:
-                log.debug(f"Query to {node.ip}:{node.port} failed (no response)")
                 return {'found': False, 'neighbors': [], 'node': None}
             
             neighbors = []
             found_target = False
             target_node = None
             
-            # Parse response - check if target is in the returned nodes
             if result[1]:
-                log.debug(f"Got {len(result[1])} nodes from {node.ip}:{node.port}")
-                
                 for node_tuple in result[1]:
                     if len(node_tuple) >= 3:
                         returned_id, ip, port = node_tuple[:3]
@@ -565,20 +588,12 @@ class NodeSearch:
                         
                         returned_node = Node(returned_id, ip, port, rwp_port)
                         
-                        # Calculate distance to target for logging
-                        distance_to_target = self.target_node.distance_to(returned_node)
-                        
-                        # Check if this is our target (EXACT match)
                         if returned_id == self.target_node_id:
                             found_target = True
                             target_node = returned_node
                             log.info(f"FOUND TARGET at {ip}:{port}!")
                         else:
                             neighbors.append(returned_node)
-                            log.debug(f"  Neighbor: {returned_id.hex()[:16]}... at {ip}:{port} "
-                                    f"(distance to target: {distance_to_target})")
-            else:
-                log.debug(f"Empty response from {node.ip}:{node.port}")
             
             return {
                 'found': found_target,
