@@ -58,7 +58,6 @@ class Config:
     
     # NEW: Search and routing limits
     MAX_NEIGHBORS_PER_NODE = 3
-    SEARCH_MAX_HOPS = 10
     SEARCH_TIMEOUT = 30.0
     SEARCH_PARALLELISM = 3
     
@@ -394,13 +393,12 @@ class SearchResult:
 class NodeSearch:
     """Handles iterative node search with ring-topology cycle detection."""
     
-    def __init__(self, protocol, target_node_id: bytes, max_hops: int = Config.SEARCH_MAX_HOPS,
+    def __init__(self, protocol, target_node_id: bytes,
                 timeout: float = Config.SEARCH_TIMEOUT, alpha: int = Config.SEARCH_PARALLELISM):
         """Initialize NodeSearch with cycle detection."""
         self.protocol = protocol
         self.target_node_id = target_node_id
         self.target_node = Node(target_node_id)
-        self.max_hops = max_hops
         self.timeout = timeout
         self.alpha = alpha
         
@@ -414,9 +412,10 @@ class NodeSearch:
     async def search(self) -> SearchResult:
         """
         Perform iterative search with ring-topology cycle detection.
-        Stops when target found, max hops reached, or network cycle completed.
+        Stops when target found, network cycle completed, or timeout reached.
+        Relies SOLELY on cycle detection - no arbitrary hop limit.
         """
-        log.info(f"Starting iterative search for node {self.target_node_id.hex()}")
+        log.info(f"Starting pure cycle-detection search for node {self.target_node_id.hex()}")
 
         # Disable routing-table learning during search
         old_flag = self.protocol.learning_enabled
@@ -459,8 +458,12 @@ class NodeSearch:
             # Track all known candidates for querying
             all_candidates = list(current_closest)
 
-            # Iterative search with cycle detection
-            for hop in range(self.max_hops):
+            # Iterative search with cycle detection - NO MAX HOPS
+            hop = 0
+            while True:  # Changed from for loop to while True
+                hop += 1
+                
+                # Primary termination: timeout
                 if time.time() - self.start_time > self.timeout:
                     log.warning(f"Search timed out after {hop} hops")
                     break
@@ -474,7 +477,7 @@ class NodeSearch:
                 # Query closest unqueried nodes
                 nodes_to_query = sorted(unqueried, key=lambda n: self.target_node.distance_to(n))[:self.alpha]
 
-                log.info(f"Hop {hop + 1}: Querying {len(nodes_to_query)} nodes "
+                log.info(f"Hop {hop}: Querying {len(nodes_to_query)} nodes "
                         f"(best distance so far: {best_distance}, "
                         f"seen {len(self.seen_nodes)} unique nodes)")
 
@@ -488,7 +491,7 @@ class NodeSearch:
                 results = await asyncio.gather(*query_tasks, return_exceptions=True)
 
                 # Process results with enhanced cycle detection
-                truly_new_nodes = []  # NEW: Track genuinely new discoveries
+                truly_new_nodes = []  # Track genuinely new discoveries
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         log.debug(f"Query to {nodes_to_query[i].ip}:{nodes_to_query[i].port} "
@@ -496,10 +499,10 @@ class NodeSearch:
                         continue
 
                     if result['found']:
-                        log.info(f"Target node found after {hop + 1} hops!")
+                        log.info(f"Target node found after {hop} hops!")
                         return SearchResult(
                             found=True, target_node=result['node'],
-                            hops=hop + 1, path=self.path,
+                            hops=hop, path=self.path,
                             search_time=time.time() - self.start_time,
                             nodes_queried=self.nodes_queried,
                             cycle_detected=False
@@ -518,14 +521,21 @@ class NodeSearch:
                             if neighbor.id not in self.queried_nodes:
                                 truly_new_nodes.append(neighbor)
 
-                # UPDATED: Robust cycle detection
+                # Primary cycle detection: no truly new nodes discovered
                 if not truly_new_nodes:
-                    self.cycle_detected = True
-                    log.info(f"Network cycle detected after {hop + 1} hops: "
-                            f"queried {len(self.queried_nodes)} nodes, "
-                            f"seen {len(self.seen_nodes)} total unique nodes, "
-                            f"no new nodes discovered")
-                    break
+                    self._consecutive_no_progress = getattr(self, '_consecutive_no_progress', 0) + 1
+                    if self._consecutive_no_progress >= 5:
+                        self.cycle_detected = True
+                        log.info(f"Network cycle COMPLETED after {hop} hops: "
+                                f"queried {len(self.queried_nodes)} nodes, "
+                                f"traversed {len(self.seen_nodes)} total unique nodes, "
+                                f"no new nodes for {self._consecutive_no_progress} consecutive hops")
+                        break
+                    else:
+                        log.debug(f"No new nodes in hop {hop} (progress counter: {self._consecutive_no_progress}), continuing...")
+                        continue
+                else:
+                    self._consecutive_no_progress = 0
 
                 # Update current closest candidates
                 current_closest = sorted(
@@ -2171,7 +2181,7 @@ class RRKDHT:
         self.messaging = SecureMessaging(self.signing_private_key, self.signing_public_key)
         
         # Initialize RWP handler
-        peer_id = generate_peer_id(self.signing_public_key)
+        peer_id = self.node.id.hex()
         self.rwp_handler = RWPDHTHandler(
             peer_id, 
             self.messaging, 
@@ -2618,13 +2628,7 @@ class RRKDHT:
     async def _find_closest_nodes_to_key(self, key_hash: bytes, k: int = None) -> List[Node]:
         """
         Find the k nodes with Node_IDs closest to the given key hash using iterative search.
-        
-        Args:
-            key_hash: The key hash to find closest nodes for
-            k: Number of closest nodes to find (defaults to REPLICATION_FACTOR)
-        
-        Returns:
-            List of k closest nodes
+        Relies SOLELY on convergence detection - no arbitrary iteration limit.
         """
         if k is None:
             k = Config.REPLICATION_FACTOR
@@ -2652,11 +2656,12 @@ class RRKDHT:
             
             log.debug(f"Initial search - our distance: {our_distance}, best neighbor distance: {best_distance}")
             
-            # Iteratively find closer nodes
+            # Iteratively find closer nodes - NO MAX ITERATIONS, uses convergence
             improved = True
             iteration = 0
+            no_improvement_count = 0
             
-            while improved and iteration < Config.SEARCH_MAX_HOPS:
+            while improved:
                 iteration += 1
                 improved = False
                 
@@ -2700,7 +2705,15 @@ class RRKDHT:
                     if new_best < best_distance:
                         best_distance = new_best
                         improved = True
+                        no_improvement_count = 0
                         log.debug(f"Iteration {iteration}: Found closer nodes, best distance now: {best_distance}")
+                    elif new_best == best_distance:
+                        no_improvement_count += 1
+                        if no_improvement_count >= 3:
+                            log.debug(f"Convergence: no distance improvement for {no_improvement_count} iterations")
+                            break
+                    else:
+                        no_improvement_count = 0
             
             # Remove duplicates from all candidates
             unique_candidates = {n.id: n for n in all_candidates}
@@ -2712,12 +2725,6 @@ class RRKDHT:
             )[:k]
             
             log.debug(f"Found {len(sorted_candidates)} closest nodes after {iteration} iterations")
-            
-            # Log the final distances
-            for i, node in enumerate(sorted_candidates):
-                distance = target_node.distance_to(node)
-                is_us = " (US)" if node.id == self.protocol.source_node.id else ""
-                log.debug(f"  Closest node {i+1}: {node.ip}:{node.port} (distance: {distance}){is_us}")
             
             return sorted_candidates
             
@@ -3312,7 +3319,6 @@ class RRKDHT:
             searcher = NodeSearch(
                 self.protocol,
                 target_node_id,
-                max_hops=Config.SEARCH_MAX_HOPS,
                 timeout=Config.SEARCH_TIMEOUT,
                 alpha=Config.SEARCH_PARALLELISM
             )
