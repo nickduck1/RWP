@@ -1393,7 +1393,9 @@ class RRKDHTProtocol(RPCProtocol):
 
     def welcome_if_new(self, node):
         """
-        Enhanced welcome with duplicate prevention
+        Enhanced welcome with bidirectional connection guarantee.
+        If a node contacts us, we MUST acknowledge them in our routing table,
+        even if it means temporarily exceeding limits.
         """
         # Skip if it's ourselves
         if node.id == self.source_node.id:
@@ -1423,8 +1425,8 @@ class RRKDHTProtocol(RPCProtocol):
                 # Update node with rendezvous key
                 node.rendezvous_key = node_info.rendezvous_key
         
-        # Add to routing table
-        self.router.add_contact(node)
+        # CRITICAL: Force add contact - they contacted us, we must acknowledge
+        self.router.add_contact(node, force_bidirectional=True)
 
     def _find_existing_node(self, target_node):
         """Find existing node in routing table by ID or address."""
@@ -1505,10 +1507,13 @@ class KBucket:
         return node.id not in self.nodes
 
     def add_node(self, node):
-        """Add node but prevent duplicates and respect max neighbors limit."""
+        """
+        Add node with strict bucket size limits.
+        Returns True if added to main bucket, False if bucket is full.
+        """
         # Check if node already exists by ID
         if node.id in self.nodes:
-            # Update existing node with new information
+            # Update existing node
             existing = self.nodes[node.id]
             existing.ip = node.ip
             existing.port = node.port
@@ -1520,11 +1525,10 @@ class KBucket:
             self.nodes[node.id] = existing
             return True
         
-        # Check for duplicate by address (ip:port combination)
+        # Check for duplicate by address
         for existing_node in self.nodes.values():
             if (existing_node.ip == node.ip and 
                 existing_node.port == node.port):
-                # Same address, different ID - update the existing node
                 log.debug(f"Found duplicate address {node.ip}:{node.port}, updating existing node")
                 existing_node.ip = node.ip
                 existing_node.port = node.port
@@ -1533,17 +1537,21 @@ class KBucket:
                 existing_node.touch()
                 return True
         
-        # New node - add it
-        if len(self) < self.ksize:
+        # New node - check bucket capacity
+        if len(self.nodes) < self.ksize:
             self.nodes[node.id] = node
+            self.touch_last_updated()
             return True
         else:
-            # Bucket full, add to replacement nodes
+            # Bucket full - add to replacement candidates
             if node.id in self.replacement_nodes:
                 del self.replacement_nodes[node.id]
             self.replacement_nodes[node.id] = node
+            
+            # Limit replacement node list size
             while len(self.replacement_nodes) > self.max_replacement_nodes:
                 self.replacement_nodes.popitem(last=False)
+            
             return False
 
     def depth(self):
@@ -1697,42 +1705,59 @@ class RoutingTable:
         return self.get_total_neighbor_count() >= Config.MAX_NEIGHBORS_PER_NODE
 
     def should_accept_new_neighbor(self, node):
-        """Determine if we should accept a new neighbor based on limits and utility."""
-        # Always accept if under limit
+        """
+        Determine if we should accept a new neighbor based on bucket diversity.
+        Prioritizes filling empty/sparse buckets over pure distance optimization.
+        """
+        # Always accept if under global limit
         if not self.is_at_neighbor_limit():
             return True
         
-        # If at limit, only accept if this node is closer than our furthest neighbor
-        index = self.get_bucket_for(node)
-        bucket = self.buckets[index]
+        # Get the bucket this new node belongs to
+        new_node_bucket_index = self.get_bucket_for(node)
+        new_node_bucket = self.buckets[new_node_bucket_index]
         
-        # If bucket isn't full, accept
-        if len(bucket) < bucket.ksize:
+        # If the target bucket has room, accept (bucket-local limit)
+        if len(new_node_bucket) < new_node_bucket.ksize:
             return True
         
-        # Check if this node would be more useful than existing nodes
-        # by comparing distances to our node
-        furthest_distance = 0
-        furthest_node = None
+        # Calculate bucket statistics
+        bucket_sizes = [len(bucket.get_nodes()) for bucket in self.buckets]
+        max_bucket_size = max(bucket_sizes) if bucket_sizes else 0
+        avg_bucket_size = sum(bucket_sizes) / len(bucket_sizes) if bucket_sizes else 0
+        new_bucket_size = len(new_node_bucket)
         
-        for b in self.buckets:
-            for existing_node in b.get_nodes():
-                distance = self.node.distance_to(existing_node)
-                if distance > furthest_distance:
-                    furthest_distance = distance
-                    furthest_node = existing_node
+        # Find buckets that are over-represented (larger than average)
+        over_represented = [
+            (i, bucket, len(bucket.get_nodes())) 
+            for i, bucket in enumerate(self.buckets) 
+            if len(bucket.get_nodes()) > avg_bucket_size
+        ]
         
-        new_node_distance = self.node.distance_to(node)
+        if not over_represented:
+            # All buckets are equally filled - reject to maintain balance
+            log.debug(f"All buckets balanced at ~{avg_bucket_size:.1f} nodes - rejecting")
+            return False
         
-        # Only accept if new node is closer than our furthest node
-        if new_node_distance < furthest_distance:
-            # Remove the furthest node to make room
-            if furthest_node:
-                self.remove_contact(furthest_node)
-                log.info(f"Replaced furthest neighbor {furthest_node.ip}:{furthest_node.port} "
-                        f"with closer node {node.ip}:{node.port}")
-            return True
+        # Accept if new node's bucket is smaller than the largest bucket
+        if new_bucket_size < max_bucket_size:
+            # Remove a node from the most over-represented bucket
+            over_represented.sort(key=lambda x: x[2], reverse=True)
+            victim_bucket_index, victim_bucket, victim_size = over_represented[0]
+            
+            # Find least recently seen node in victim bucket
+            victim_nodes = victim_bucket.get_nodes()
+            if victim_nodes:
+                least_recent = min(victim_nodes, key=lambda n: n.last_seen)
+                log.info(f"Bucket diversity: removing node from over-represented bucket {victim_bucket_index} "
+                        f"({victim_size} nodes) to accept node for bucket {new_node_bucket_index} "
+                        f"({new_bucket_size} nodes)")
+                self.remove_contact(least_recent)
+                return True
         
+        log.debug(f"Rejecting node: would not improve bucket diversity "
+                f"(target bucket size: {new_bucket_size}, max bucket size: {max_bucket_size}, "
+                f"avg: {avg_bucket_size:.1f})")
         return False
 
     def print_routing_table(self, show_empty_buckets=False, show_replacement_nodes=False):
@@ -1881,19 +1906,26 @@ class RoutingTable:
         index = self.get_bucket_for(node)
         return self.buckets[index].is_new_node(node)
 
-    def add_contact(self, node):
-        """Add contact with duplicate prevention, neighbor limits, and enhanced logging."""
+    def add_contact(self, node, force_bidirectional=False):
+        """
+        Add contact with bucket diversity enforcement and bidirectional guarantee.
+        
+        Args:
+            node: The node to add
+            force_bidirectional: If True, override diversity checks to ensure
+                            bidirectional connectivity (used when node contacts us)
+        """
         # Skip if it's ourselves
         if node.id == self.node.id:
             log.debug(f"Skipping self-node: {node.ip}:{node.port}")
             return
             
-        # Check if we already have this exact node (by ID and address)
+        # Check for existing node
         existing_node = self._find_existing_node(node)
         if existing_node:
-            log.debug(f"Updating existing node {existing_node.ip}:{existing_node.port} with new info from {node.ip}:{node.port}")
-
-            # Prefer non-loopback IP (keep existing if new is loopback and existing isn't)
+            log.debug(f"Updating existing node {existing_node.ip}:{existing_node.port}")
+            
+            # Prefer non-loopback IP
             def is_loopback(ip):
                 return ip.startswith('127.') or ip == 'localhost'
 
@@ -1903,7 +1935,6 @@ class RoutingTable:
                 existing_node.ip = node.ip
                 log.debug(f"Updated IP to {node.ip}")
 
-            # Always update port/rwp/rendezvous if provided (assuming they might change)
             if node.port:
                 existing_node.port = node.port
             existing_node.rwp_port = node.rwp_port
@@ -1911,38 +1942,60 @@ class RoutingTable:
             existing_node.touch()
             return
         
-        # Check if we should accept this new neighbor based on limits
-        if not self.should_accept_new_neighbor(node):
-            log.debug(f"At neighbor limit ({Config.MAX_NEIGHBORS_PER_NODE}), "
-                    f"rejecting distant node: {node.ip}:{node.port}")
-            return
-        
-        # If at or above limit and acceptable (closer), remove farthest to make space
-        if self.get_total_neighbor_count() >= Config.MAX_NEIGHBORS_PER_NODE:
-            all_neighbors = self.get_neighbors_by_distance()
-            if all_neighbors:
-                farthest = all_neighbors[-1]
-                log.debug(f"Removing farthest node {farthest.ip}:{farthest.port} to add closer {node.ip}:{node.port}")
-                self.remove_contact(farthest)
+        # Check if we should accept based on bucket diversity
+        if self.is_at_neighbor_limit() and not force_bidirectional:
+            if not self.should_accept_new_neighbor(node):
+                log.debug(f"Rejecting node {node.ip}:{node.port} - would harm bucket diversity")
+                return
         
         log.debug(f"Adding new contact: {node.ip}:{node.port} (RWP: {node.rwp_port}) ID: {node.id.hex()}")
         
-        # Touch the node to update last_seen
+        # Touch the node
         node.touch()
         
         index = self.get_bucket_for(node)
         bucket = self.buckets[index]
 
-        if bucket.add_node(node):
+        # Try to add to bucket
+        added = bucket.add_node(node)
+        
+        if added:
             log.info(f"Successfully added node to routing table: {node.ip}:{node.port} "
-                    f"(RWP: {node.rwp_port}) - Total neighbors: {self.get_total_neighbor_count()}")
+                    f"(bucket {index}) - Total neighbors: {self.get_total_neighbor_count()}")
             return
-
-        if bucket.has_in_range(self.node) or bucket.depth() % 5 != 0:
-            log.debug(f"Splitting bucket {index} to accommodate new node")
+        
+        # Bucket is full
+        if force_bidirectional:
+            # CRITICAL PATH: Node contacted us, we MUST add them
+            # Make room by removing least recently seen node from this bucket
+            log.info(f"Force-adding bidirectional contact {node.ip}:{node.port}, making room in bucket {index}")
+            
+            # Find least recently seen node in this bucket
+            bucket_nodes = bucket.get_nodes()
+            if bucket_nodes:
+                least_recent = min(bucket_nodes, key=lambda n: n.last_seen)
+                log.info(f"  Removing least recent node {least_recent.ip}:{least_recent.port} "
+                        f"(last seen {int(time.time() - least_recent.last_seen)}s ago)")
+                bucket.remove_node(least_recent)
+                
+                # Now add the new node
+                if bucket.add_node(node):
+                    log.info(f"  Successfully force-added {node.ip}:{node.port}")
+                    return
+        
+        # Standard bucket splitting logic
+        if bucket.has_in_range(self.node):
+            # Split bucket if it contains our own ID
+            log.debug(f"Splitting bucket {index} (contains our ID)")
             self.split_bucket(index)
-            self.add_contact(node)
+            self.add_contact(node, force_bidirectional=force_bidirectional)  # Retry with same flag
+        elif bucket.depth() % 5 != 0:
+            # Split bucket if depth criteria met
+            log.debug(f"Splitting bucket {index} (depth criteria)")
+            self.split_bucket(index)
+            self.add_contact(node, force_bidirectional=force_bidirectional)  # Retry with same flag
         else:
+            # Cannot split - add to replacement nodes
             log.debug(f"Node added to replacement nodes in bucket {index}")
             asyncio.ensure_future(self.protocol.call_ping(bucket.head()))
 
@@ -4073,3 +4126,8 @@ class RWPDHTHandler(RWPProtocolHandler):
         """Generate epoch-specific key."""
         epoch_data = f"{key.hex()}:epoch:{epoch}"
         return digest(epoch_data)
+
+
+#Best idea so far!!! 
+#This idea was told to me by an AI.       
+#(90% of this script is by AI)
