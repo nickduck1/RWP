@@ -419,7 +419,7 @@ class NodeSearch:
 
         # Disable routing-table learning during search
         old_flag = self.protocol.learning_enabled
-        self.protocol.learning_enabled = False
+        #self.protocol.learning_enabled = False
 
         try:
             # Start with our closest known neighbors to target
@@ -429,12 +429,23 @@ class NodeSearch:
             )
 
             if not current_closest:
-                log.warning("No neighbors available to start search")
-                return SearchResult(
-                    found=False, target_node=None, hops=0,
-                    path=self.path, search_time=time.time() - self.start_time,
-                    nodes_queried=0, cycle_detected=False
-                )
+                log.warning("No neighbors close to target, using all available neighbors")
+                all_neighbors = []
+                for bucket in self.protocol.router.buckets:
+                    all_neighbors.extend(bucket.get_nodes())
+                
+                if not all_neighbors:
+                    log.warning("No neighbors available to start search")
+                    return SearchResult(
+                        found=False, target_node=None, hops=0,
+                        path=self.path, search_time=time.time() - self.start_time,
+                        nodes_queried=0, cycle_detected=False
+                    )
+                
+                # Sort by distance and take alpha closest (even if far away)
+                all_neighbors.sort(key=lambda n: self.target_node.distance_to(n))
+                current_closest = all_neighbors[:self.alpha]
+                log.debug(f"Starting with {len(current_closest)} farthest-available neighbors")
 
             # Initialize seen_nodes with starting neighbors
             for node in current_closest:
