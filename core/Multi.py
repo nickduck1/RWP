@@ -172,6 +172,8 @@ class NodeInstance:
                 return self._format_routing_table(show_empty=True)
             elif cmd == 'rt-repl':
                 return self._format_routing_table(show_replacement=True)
+            elif cmd == 'rt-info':
+                return self._format_routing_info()
             elif cmd == 'neighbors':
                 return self._format_neighbors()
             elif cmd == 'health':
@@ -203,12 +205,57 @@ class NodeInstance:
         
         output = io.StringIO()
         with redirect_stdout(output):
+            # Get max_neighbors from router config
+            max_neighbors = self.dht_node.protocol.router.max_neighbors
+            print(f"Max Neighbors Limit: {max_neighbors}\n")  # ← ADD THIS LINE
             self.dht_node.protocol.router.print_routing_table(
                 show_empty_buckets=show_empty,
                 show_replacement_nodes=show_replacement
             )
         return output.getvalue()
     
+    def _format_routing_info(self) -> str:
+        """Format concise routing table info including max_neighbors."""
+        if not self.dht_node.protocol:
+            return "Node not ready"
+        
+        # Get routing info
+        routing_info = self.dht_node.protocol.router.get_detailed_routing_info()
+        
+        # Get health info SEPARATELY (this is the fix!)
+        health_report = self.dht_node.protocol.router.analyze_routing_health()
+        
+        output = [f"\n📊 Routing Info for Node {self.node_id}:"]
+        output.append("=" * 60)
+        output.append(f"{'Configuration':<20} {'Value':<15} {'Status':<15}")
+        output.append("-" * 60)
+        output.append(f"{'Max Neighbors':<20} {routing_info['max_neighbors']:<15} {'(LIMIT)':<15}")
+        output.append(f"{'KSize':<20} {routing_info['ksize']:<15} {'(BUCKET SIZE)':<15}")
+        output.append(f"{'Total Nodes':<20} {routing_info['total_nodes']:<15} {'(CURRENT)':<15}")
+        output.append(f"{'Total Buckets':<20} {routing_info['total_buckets']:<15}")
+        output.append(f"{'Lonely Buckets':<20} {routing_info['lonely_buckets']:<15}")
+        output.append(f"{'Stale Nodes':<20} {routing_info['stale_nodes']:<15} {'⚠️' if routing_info['stale_nodes'] > 0 else '✓':<15}")
+        output.append(f"{'Failed Nodes':<20} {routing_info['failed_nodes']:<15} {'❌' if routing_info['failed_nodes'] > 0 else '✓':<15}")
+        output.append(f"{'Replacement Nodes':<20} {routing_info['total_replacement_nodes']:<15}")
+        
+        # Health status (using the separate health_report variable)
+        output.append("\n" + "=" * 60)
+        health_status = health_report['overall_health']
+        status_icon = '✅' if health_status == 'GOOD' else '⚠️'
+        output.append(f"Health: {health_status} {status_icon}")
+        output.append("-" * 60)
+        output.append(f"Fill Ratio:     {health_report['metrics']['fill_ratio']:.2%}")
+        output.append(f"Stale Ratio:    {health_report['metrics']['stale_ratio']:.2%}")
+        output.append(f"Failed Ratio:   {health_report['metrics']['failed_ratio']:.2%}")
+        
+        # Show issues if any
+        if health_report['issues']:
+            output.append("\n⚠️  Issues Found:")
+            for issue in health_report['issues']:
+                output.append(f"   • {issue}")
+        
+        return "\n".join(output)
+
     def _format_neighbors(self) -> str:
         """Format neighbors list."""
         if not self.dht_node.protocol:
@@ -277,6 +324,7 @@ Available Commands:
   rt, routing         - Show routing table
   rt-full             - Show routing table with empty buckets
   rt-repl             - Show routing table with replacement nodes
+  rt-info             - Show concise routing info (including max_neighbors)
   neighbors           - Show all neighbors
   health              - Show routing health analysis
   status              - Show node status
