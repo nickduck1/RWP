@@ -20,14 +20,8 @@ This is an early release version!
 
 What’s Left:
 - The only thing remaining in the Core is implementing the rendezvous_key search/find feature. (DONE)
-- Integrate the real server (not tserver.py), with the core (RRKDHT.py).
+- Integrate the real server (Server.py, not tserver.py), with the core (RRKDHT.py). Now
 
-Interrupted integration, Implemented search cycle detection!
-PROBLEM: I'm facing network partitioning problem (Split-brain)
-I thought for a week for a solution, I didn't find one :(
-
-Please, if anyone knows how to fix this problem please tell me!
-(I'M BACK, LET ME COOK!)
 Note:
 It may take a while to be ready for real use (production), Because i have studies and AI is not that good in helping.
 (Also i don't get paid for this shit)
