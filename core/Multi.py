@@ -113,12 +113,7 @@ class NodeInstance:
                 await self.dht_node.bootstrap(self.bootstrap_addresses)
             
             # Store node info
-            self.node_info.update({
-                'node_id_hex': self.dht_node.node.id.hex(),
-                'rendezvous_key': self.dht_node.get_rendezvous_key(),
-                'long_id': self.dht_node.node.long_id,
-                'status': 'RUNNING'
-            })
+            self._update_node_info()  # Changed to use new method
             
             log.info(f"Node {self.node_id} is fully operational")
             
@@ -129,6 +124,16 @@ class NodeInstance:
             log.error(f"Failed to start node {self.node_id}: {e}")
             self.node_info['status'] = f'ERROR: {str(e)}'
     
+    def _update_node_info(self):
+        """Update node_info with current values from dht_node."""
+        if self.dht_node:
+            self.node_info.update({
+                'node_id_hex': self.dht_node.node.id.hex(),
+                'rendezvous_key': self.dht_node.get_rendezvous_key(),
+                'long_id': self.dht_node.node.long_id,
+                'status': 'RUNNING'
+            })
+
     async def _command_handler(self):
         """Handle commands from the GUI thread."""
         while self.running:
@@ -295,17 +300,23 @@ class NodeInstance:
         return "\n".join(output)
     
     def _format_status(self) -> str:
-        """Format node status."""
+        """Format node status with live rendezvous key."""
         output = [f"\nStatus for Node {self.node_id}:"]
         output.append("=" * 50)
         output.append(f"DHT Port: {self.dht_port}")
         output.append(f"RWP Port: {self.rwp_port}")
-        output.append(f"Node ID: {self.node_info['node_id_hex']}")
-        output.append(f"Rendezvous Key: {self.node_info['rendezvous_key']}")
-        output.append(f"Status: {self.node_info['status']}")
         
         if self.dht_node:
+            # Get live values from dht_node
+            output.append(f"Node ID: {self.dht_node.node.id.hex()}")
+            output.append(f"Rendezvous Key: {self.dht_node.get_rendezvous_key()}")
+            output.append(f"Status: RUNNING")
             output.append(f"Neighbors: {len(self.dht_node.bootstrappable_neighbors())}")
+        else:
+            # Fallback to cached values
+            output.append(f"Node ID: {self.node_info.get('node_id_hex', 'N/A')}")
+            output.append(f"Rendezvous Key: {self.node_info.get('rendezvous_key', 'N/A')}")
+            output.append(f"Status: {self.node_info.get('status', 'UNKNOWN')}")
         
         return "\n".join(output)
     
@@ -693,6 +704,11 @@ class TestNetworkGUI:
         for node_id in sorted(self.nodes.keys()):
             node = self.nodes[node_id]
             status_indicator = "🟢" if node.running else "🔴"
+            
+            # Update node_info with live data if node is running
+            if node.running and node.dht_node:
+                node._update_node_info()
+            
             display_text = f"{status_indicator} Node {node_id:2d} | DHT:{node.dht_port} RWP:{node.rwp_port} | {node.node_info['status']}"
             self.node_listbox.insert(tk.END, display_text)
         
