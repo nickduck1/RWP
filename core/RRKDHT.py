@@ -56,18 +56,30 @@ class Config:
     RWP_TIMEOUT = 10.0
     MAX_MESSAGE_SIZE = 65536
     
-    # NEW: Search and routing limits
-    MAX_NEIGHBORS_PER_NODE = 15
+    # Search and routing limits
     SEARCH_TIMEOUT = 30.0
     SEARCH_PARALLELISM = 3
     
-    # NEW: Responsible node tracking
-    MIN_RESPONSIBLE_NODES = 1  # Minimum nodes that must know about us
-    RESPONSIBLE_CHECK_INTERVAL = 180  # Check every 3 minutes
+    # Node ID configuration
+    NODE_ID_BITS = 160  # SHA-1 produces 160-bit node IDs
+    
+    # Responsible node tracking
+    MIN_RESPONSIBLE_NODES = 1
+    RESPONSIBLE_CHECK_INTERVAL = 180
 
-    MAX_REJOIN_ATTEMPTS = 5  # Try 5 times before regenerating identity
-    MAX_IDENTITY_REGENERATIONS = 3  # Maximum identity regenerations before giving up
+    MAX_REJOIN_ATTEMPTS = 5
+    MAX_IDENTITY_REGENERATIONS = 3
     REJOIN_VERIFICATION_WAIT = 2
+    
+    @staticmethod
+    def get_max_neighbors(ksize):
+        """
+        Calculate maximum neighbors based on ksize and node ID space.
+        Formula: ksize × node_id_bits
+        This ensures each bucket can be fully populated without artificial limits.
+        """
+        return ksize * Config.NODE_ID_BITS
+    
 # ============================================================================
 # CRYPTOGRAPHIC UTILITIES
 # ============================================================================
@@ -419,7 +431,7 @@ class NodeSearch:
 
         # Disable routing-table learning during search
         old_flag = self.protocol.learning_enabled
-        #self.protocol.learning_enabled = False
+        self.protocol.learning_enabled = False
 
         try:
             # Start with our closest known neighbors to target
@@ -1608,6 +1620,7 @@ class RoutingTable:
         self.node = node
         self.protocol = protocol
         self.ksize = ksize
+        self.max_neighbors = Config.get_max_neighbors(ksize)
         self.flush()
 
     def flush(self):
@@ -1619,6 +1632,8 @@ class RoutingTable:
             'total_buckets': len(self.buckets),
             'total_nodes': 0,
             'total_replacement_nodes': 0,
+            'max_neighbors': self.max_neighbors,
+            'ksize': self.ksize,
             'lonely_buckets': len(self.lonely_buckets()),
             'buckets': [],
             'node_distribution': {},
@@ -1705,19 +1720,21 @@ class RoutingTable:
 
     def is_at_neighbor_limit(self):
         """Check if we're at the maximum neighbor limit."""
-        return self.get_total_neighbor_count() >= Config.MAX_NEIGHBORS_PER_NODE
+        return self.get_total_neighbor_count() >= self.max_neighbors
 
     def should_accept_new_neighbor(self, node):
         """Determine if we should accept a new neighbor based on limits and utility."""
+        current_total = self.get_total_neighbor_count()
+        
         # Always accept if under limit
-        if not self.is_at_neighbor_limit():
+        if current_total < self.max_neighbors:
             return True
         
         # If at limit, only accept if this node is closer than our furthest neighbor
         index = self.get_bucket_for(node)
         bucket = self.buckets[index]
         
-        # If bucket isn't full, accept
+        # If bucket isn't full, accept (assuming we're making room below)
         if len(bucket) < bucket.ksize:
             return True
         
@@ -1741,9 +1758,12 @@ class RoutingTable:
             if furthest_node:
                 self.remove_contact(furthest_node)
                 log.info(f"Replaced furthest neighbor {furthest_node.ip}:{furthest_node.port} "
-                        f"with closer node {node.ip}:{node.port}")
+                        f"with closer node {node.ip}:{node.port} "
+                        f"(limit: {self.max_neighbors}, current: {current_total})")
             return True
         
+        log.debug(f"Rejected node {node.ip}:{node.port} - at limit {self.max_neighbors} "
+                f"and not closer than furthest neighbor")
         return False
 
     def print_routing_table(self, show_empty_buckets=False, show_replacement_nodes=False):
@@ -1753,6 +1773,7 @@ class RoutingTable:
         print(f"\n{'='*80}")
         print(f"ROUTING TABLE DEBUG - Node ID: {self.node.id.hex()}")
         print(f"{'='*80}")
+        print(f"Max Neighbors: {routing_info['max_neighbors']} | KSize: {routing_info['ksize']}")
         print(f"Total Buckets: {routing_info['total_buckets']}")
         print(f"Total Nodes: {routing_info['total_nodes']}")
         print(f"Total Replacement Nodes: {routing_info['total_replacement_nodes']}")
@@ -1924,19 +1945,22 @@ class RoutingTable:
         
         # Check if we should accept this new neighbor based on limits
         if not self.should_accept_new_neighbor(node):
-            log.debug(f"At neighbor limit ({Config.MAX_NEIGHBORS_PER_NODE}), "
+            log.debug(f"At neighbor limit ({self.max_neighbors}), "
                     f"rejecting distant node: {node.ip}:{node.port}")
             return
         
+        current_count = self.get_total_neighbor_count()
+        
         # If at or above limit and acceptable (closer), remove farthest to make space
-        if self.get_total_neighbor_count() >= Config.MAX_NEIGHBORS_PER_NODE:
+        if current_count >= self.max_neighbors:
             all_neighbors = self.get_neighbors_by_distance()
             if all_neighbors:
                 farthest = all_neighbors[-1]
                 log.debug(f"Removing farthest node {farthest.ip}:{farthest.port} to add closer {node.ip}:{node.port}")
                 self.remove_contact(farthest)
         
-        log.debug(f"Adding new contact: {node.ip}:{node.port} (RWP: {node.rwp_port}) ID: {node.id.hex()}")
+        log.debug(f"Adding new contact: {node.ip}:{node.port} (RWP: {node.rwp_port}) ID: {node.id.hex()} "
+                f"(limit: {self.max_neighbors}, current: {current_count})")
         
         # Touch the node to update last_seen
         node.touch()
@@ -1945,8 +1969,9 @@ class RoutingTable:
         bucket = self.buckets[index]
 
         if bucket.add_node(node):
+            new_count = self.get_total_neighbor_count()
             log.info(f"Successfully added node to routing table: {node.ip}:{node.port} "
-                    f"(RWP: {node.rwp_port}) - Total neighbors: {self.get_total_neighbor_count()}")
+                    f"(RWP: {node.rwp_port}) - Total neighbors: {new_count}/{self.max_neighbors}")
             return
 
         if bucket.has_in_range(self.node) or bucket.depth() % 5 != 0:
