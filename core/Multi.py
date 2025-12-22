@@ -189,10 +189,10 @@ class NodeInstance:
                 return self._format_debug()
             elif cmd.startswith('ping'):
                 return await self._handle_ping(args)
-            elif cmd.startswith('search'):
-                return await self._handle_search(args)
             elif cmd.startswith('search-rk'):
                 return await self._handle_search_rk(args)
+            elif cmd.startswith('search'):
+                return await self._handle_search(args)
             elif cmd == 'help':
                 return self._format_help()
             else:
